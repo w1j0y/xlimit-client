@@ -225,43 +225,438 @@ xLimit Recon writes output under `recon_output/<target>_<timestamp>/`.
 - Use required program tracking headers when applicable.
 - The public prompts use placeholders. Replace `<CUSTOM_HEADER_OR_NONE>` with the tracking header required by your program, or `none` if no header is required.
 
-## Troubleshooting
+# Troubleshooting
 
-`Error: XLIMIT_API_TOKEN is not set`
+Use this section when xLimit Client, xLimit hosted retrieval, Codex, or xLimit Recon does not behave as expected.
 
-Check `~/.config/xlimit/token.env` and confirm the `XLIMIT_API_TOKEN` variable is set.
+---
 
-`Unauthorized`
+## `XLIMIT_API_TOKEN` is not set
 
-Confirm the token was copied correctly and has not been revoked. If needed, request support through `support@xlimit.org`.
+This means the client wrapper could not find your local token.
 
-DNS or network failures
+Check that the token file exists:
 
-Check local DNS, proxy, VPN, firewall, and general network access.
+```bash
+ls -l ~/.config/xlimit/token.env
+```
 
-Codex sandbox cannot reach `api.xlimit.org`
+Open it and confirm it contains:
 
-Run the wrapper from a terminal with network access, or configure the agent environment so it can make the outbound HTTPS request.
+```bash
+XLIMIT_API_TOKEN=PASTE_YOUR_TOKEN_HERE
+```
 
-Assistant gives generic advice
+The file should be readable only by your user:
 
-Paste one of the phase prompts from `examples/` directly into the session and ensure the instruction to call `~/xlimit-client/xlimit_context.sh` is present.
+```bash
+chmod 700 ~/.config/xlimit
+chmod 600 ~/.config/xlimit/token.env
+```
 
-Missing `subfinder` or `httpx`
+Then test again:
 
-Install the required recon tools and confirm they are available in `PATH`.
+```bash
+~/xlimit-client/xlimit_search_text.sh "graphql introspection authorization" knowledge
+```
 
-Permission denied on scripts
+---
+
+## Unauthorized
+
+This usually means the token is missing, wrong, expired, or revoked.
+
+Check:
+
+```bash
+cat ~/.config/xlimit/token.env
+```
+
+Confirm:
+
+```text
+- The token was copied exactly.
+- There are no extra quotes around the token.
+- There are no spaces before or after the token.
+- The claim page was not refreshed before copying the token.
+- The token has not expired.
+- The token has not been revoked.
+```
+
+If the token was exposed, lost, or no longer works, contact:
+
+```text
+support@xlimit.org
+```
+
+---
+
+## DNS or network failures
+
+If the wrapper cannot reach the API, test normal network access first:
+
+```bash
+curl -I https://api.xlimit.org
+```
+
+Expected result:
+
+```text
+HTTP/2 404
+```
+
+A `404` from the root API path is normal. It means the domain is reachable.
+
+If this fails, check:
+
+```text
+- DNS resolution
+- VPN/proxy settings
+- firewall rules
+- local network access
+- captive portal or restricted network
+```
+
+You can also test DNS directly:
+
+```bash
+nslookup api.xlimit.org
+```
+
+or:
+
+```bash
+dig api.xlimit.org
+```
+
+---
+
+## Codex cannot reach `api.xlimit.org`
+
+If Codex fails with errors like:
+
+```text
+curl: (6) Could not resolve host: api.xlimit.org
+socket(): Operation not permitted
+can't find either v4 or v6 networking
+```
+
+the xLimit API may be working correctly, but the Codex shell sandbox may not have network access.
+
+First, test outside Codex in your normal terminal:
+
+```bash
+curl -I https://api.xlimit.org
+~/xlimit-client/xlimit_search_text.sh "graphql introspection authorization" knowledge
+```
+
+If this works outside Codex but fails inside Codex, update the Codex config.
+
+Open:
+
+```bash
+nano ~/.codex/config.toml
+```
+
+If you see:
+
+```toml
+sandbox_mode = "workspace-write"
+```
+
+add this block near the top of the file, before the `[projects...]` entries:
+
+```toml
+[sandbox_workspace_write]
+network_access = true
+```
+
+Example:
+
+```toml
+model = "gpt-5.5"
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+model_reasoning_effort = "high"
+
+[sandbox_workspace_write]
+network_access = true
+```
+
+Then fully exit Codex, start a new session, and test inside Codex:
+
+```bash
+curl -I https://api.xlimit.org
+~/xlimit-client/xlimit_search_text.sh "graphql introspection authorization" knowledge
+```
+
+Expected:
+
+```text
+curl -I https://api.xlimit.org
+→ HTTP/2 404
+
+xlimit_search_text.sh
+→ hosted retrieval results
+```
+
+If network access still fails, run the wrapper manually from a normal terminal and paste the returned context into Codex:
+
+```bash
+~/xlimit-client/xlimit_context.sh "<full task prompt>"
+```
+
+Then tell Codex:
+
+```text
+Use the following xLimit hosted retrieval context as supporting context. Do not call api.xlimit.org again in this session.
+```
+
+---
+
+## Codex or another assistant gives generic advice
+
+If the assistant gives broad or generic security advice, use one of the phased prompts in:
+
+```text
+examples/
+```
+
+Recommended order:
+
+```text
+1. examples/phase_1_rank_surfaces.md
+2. examples/phase_2_inventory.md
+3. examples/phase_2_5_class_map.md
+4. examples/phase_3_validate_or_stop.md
+```
+
+Also make sure the session includes this instruction:
+
+```text
+Use xLimit hosted retrieval when the task would benefit from xLimit security knowledge or generic operational memory.
 
 Run:
+~/xlimit-client/xlimit_context.sh "<full user prompt>"
+
+Use the returned text as supporting context for your answer.
+```
+
+If the assistant cannot access the network, run the command manually and paste the returned context into the session.
+
+---
+
+## Missing `subfinder` or `httpx`
+
+`xLimit Recon` requires:
+
+```text
+subfinder
+httpx
+```
+
+Check if they are installed:
+
+```bash
+which subfinder
+which httpx
+```
+
+If they are missing, use the optional installer:
+
+```bash
+bash scripts/install_recon_tools.sh --help
+bash scripts/install_recon_tools.sh --core
+```
+
+For a fuller local recon environment:
+
+```bash
+bash scripts/install_recon_tools.sh --full
+```
+
+Review the installer before running it because it may use `sudo` and install system packages.
+
+---
+
+## Permission denied on scripts
+
+If the installed client scripts cannot run, fix permissions:
 
 ```bash
 chmod 700 ~/xlimit-client/*.sh
 ```
 
-Claim link already used
+Then test:
 
-Claim links are single-use. Contact `support@xlimit.org` if you no longer have access to the token.
+```bash
+~/xlimit-client/xlimit_search_text.sh "graphql introspection authorization" knowledge
+```
+
+If the repo copy itself has permission issues, reinstall:
+
+```bash
+cd xlimit-client
+chmod +x install.sh
+./install.sh
+```
+
+---
+
+## Claim link already used
+
+Claim links are single-use.
+
+After the token is shown once, refreshing or reopening the claim link will return:
+
+```text
+Claim unavailable
+```
+
+This is expected.
+
+If you closed the page before saving the token, contact:
+
+```text
+support@xlimit.org
+```
+
+A new claim link may need to be issued.
+
+---
+
+## Claim link expired
+
+Claim links are temporary.
+
+If the claim link expired before you opened it, contact:
+
+```text
+support@xlimit.org
+```
+
+Do not ask for the raw token by email. xLimit does not email raw tokens.
+
+---
+
+## Token exposed or committed by mistake
+
+Treat the token like a password.
+
+If you accidentally exposed it in:
+
+```text
+- GitHub
+- screenshots
+- public prompts
+- terminal recordings
+- reports
+- shared notes
+```
+
+contact:
+
+```text
+support@xlimit.org
+```
+
+The token should be revoked and reissued.
+
+---
+
+## `xlimit_context.sh` returns too little context
+
+Try making the prompt more specific.
+
+Instead of:
+
+```text
+Help with GraphQL.
+```
+
+Use:
+
+```text
+I found a public GraphQL endpoint with introspection disabled, verbose field suggestion errors, and unauthenticated organization IDs. Help me rank safe next validation steps for an authorized assessment.
+```
+
+Better prompts usually include:
+
+```text
+- the technology
+- the observed signal
+- whether authentication exists
+- what has already been ruled out
+- the desired phase: ranking, inventory, class mapping, validation, or reporting
+```
+
+---
+
+## xLimit Recon output feels noisy
+
+Use the phased workflow instead of asking a broad follow-up.
+
+Recommended flow:
+
+```text
+Run xLimit Recon
+→ Phase 1: rank surfaces
+→ Phase 2: inventory endpoints/surfaces
+→ Phase 2.5: map vulnerability classes and plan tests
+→ Phase 3: validate or stop
+```
+
+Start with:
+
+```text
+examples/phase_1_rank_surfaces.md
+```
+
+The goal is not to test everything. The goal is to decide what is worth time, what is noise, and when to stop.
+
+---
+
+## Public API root returns `404`
+
+This is normal.
+
+For example:
+
+```bash
+curl -I https://api.xlimit.org
+```
+
+may return:
+
+```text
+HTTP/2 404
+```
+
+The root path is not a public API endpoint.
+
+Use the client wrappers instead:
+
+```bash
+~/xlimit-client/xlimit_search_text.sh "graphql introspection authorization" knowledge
+```
+
+---
+
+## Still stuck
+
+Include the following when asking for help:
+
+```text
+- operating system
+- exact command you ran
+- full error message
+- whether it works outside Codex
+- whether it fails only inside Codex
+- whether ~/.config/xlimit/token.env exists
+- whether curl -I https://api.xlimit.org works
+```
+
+Do not include your raw API token in support messages, screenshots, or GitHub issues.
 
 ## License
 
