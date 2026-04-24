@@ -12,3 +12,7 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+
+# Local agent/editor artifacts
+.codex
+prompts/

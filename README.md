@@ -2,13 +2,13 @@
 
 xLimit Client provides local client tools for approved users to query hosted xLimit retrieval from terminal agents such as Codex.
 
-Retrieval returns short snippets through the xLimit API. xLimit does not provide direct access to raw knowledge files.
+Retrieval returns short snippets through the xLimit API. xLimit does not provide direct access to raw source files.
 
 ## What this repo contains
 
 - `client/xlimit_search.sh`: low-level JSON API wrapper.
 - `client/xlimit_search_text.sh`: readable terminal output wrapper.
-- `client/xlimit_context.sh`: combined hosted knowledge and memory context wrapper for local assistants.
+- `client/xlimit_context.sh`: hosted retrieval context wrapper for local assistants.
 - `recon/xlimit_recon.py`: local authorized reconnaissance and triage helper.
 - `examples/`: Codex and recon triage prompt templates.
 
@@ -81,8 +81,6 @@ The installer does not require `sudo`. It copies client wrappers into `~/xlimit-
 ## Testing hosted retrieval
 
 ```bash
-~/xlimit-client/xlimit_search_text.sh "graphql introspection authorization" knowledge
-
 ~/xlimit-client/xlimit_context.sh "I found a public GraphQL endpoint with introspection enabled. Help me think through safe next tests."
 ```
 
@@ -138,27 +136,73 @@ python3 recon/xlimit_recon.py -d example.com --skip-js-scan
 
 Use `--custom-header` when an authorized program requires a tracking header. The header is applied to supported live requests and generated commands.
 
-## Using xLimit Recon output with Codex and xLimit knowledge
+## Using xLimit Recon with Codex and xLimit hosted retrieval
 
-1. Run:
+The most effective workflow is not only pasting `xlimit_summary.txt` and asking a broad follow-up. A stronger workflow is to run phased prompts where Codex or another local terminal agent:
+
+- Uses existing local recon artifacts under `recon_output/` first.
+- Incorporates optional user-maintained notes or current phase notes when provided.
+- Does not rediscover what is already known.
+- Calls xLimit hosted retrieval when useful.
+- Ranks surfaces before testing.
+- Inventories endpoints before vulnerability-class mapping.
+- Maps vulnerability classes before validation.
+- Stops when evidence is weak or auth/scope blocks progress.
+
+xLimit hosted retrieval is accessed with:
+
+```bash
+~/xlimit-client/xlimit_context.sh "<full task or prompt>"
+```
+
+If Codex cannot access the network or shell, run `xlimit_context.sh` manually in a terminal with network access and paste the returned context into the session.
+
+Recommended workflow:
+
+1. Run recon:
 
    ```bash
-   python3 recon/xlimit_recon.py -d example.com --custom-header "X-Bug-Bounty: researcher123"
+   python3 recon/xlimit_recon.py -d example.com --custom-header "X-Bug-Bounty: <researcher-handle>"
    ```
 
-2. Open:
+2. Review outputs:
 
    ```text
    recon_output/<target>_<timestamp>/xlimit_summary.txt
+   recon_output/<target>_<timestamp>/report.txt
+   recon_output/<target>_<timestamp>/playbook.json
+   recon_output/<target>_<timestamp>/dashboard.html
    ```
 
-3. Ask your local assistant:
+3. Start Codex in the project or workspace where the `recon_output/` directory exists.
+
+4. Add the xLimit client instruction:
 
    ```text
-   Use xLimit hosted retrieval if helpful. Based on this recon summary, rank the top surfaces by likely assessment value, explain why they matter, identify easy wins versus rabbit holes, and suggest the best next manual checks.
+   Use xLimit hosted retrieval when the task would benefit from xLimit security knowledge or generic operational memory.
+   Run:
+   ~/xlimit-client/xlimit_context.sh "<full user prompt>"
+   Use the returned text as supporting context.
    ```
 
-4. Paste `xlimit_summary.txt`.
+5. Use the phase prompts from `examples/`:
+
+   ```text
+   examples/recon_to_xlimit_prompt.md
+   examples/phase_1_rank_surfaces.md
+   examples/phase_2_inventory.md
+   examples/phase_2_5_class_map.md
+   examples/phase_3_validate_or_stop.md
+   ```
+
+6. Replace placeholders:
+
+   ```text
+   <TARGET> with the target name or recon output folder name
+   <CUSTOM_HEADER> with the required tracking header, if applicable
+   <CUSTOM_HEADER_OR_NONE> with the required tracking header, or none
+   <RECON_DIR> with the relevant recon output path
+   ```
 
 ## Output files
 
@@ -175,10 +219,11 @@ xLimit Recon writes output under `recon_output/<target>_<timestamp>/`.
 ## Security notes
 
 - Keep `~/.config/xlimit/token.env` private.
-- Do not commit tokens, `.env` files, recon outputs, screenshots, scope files, reports, memory files, or knowledge files.
+- Do not commit tokens, `.env` files, recon outputs, screenshots, scope files, reports, private notes, or raw source material.
 - Review generated recon output before sharing it outside an authorized team.
 - Keep live testing inside the written scope and rules of engagement.
 - Use required program tracking headers when applicable.
+- The public prompts use placeholders. Replace `<CUSTOM_HEADER_OR_NONE>` with the tracking header required by your program, or `none` if no header is required.
 
 ## Troubleshooting
 
@@ -197,6 +242,10 @@ Check local DNS, proxy, VPN, firewall, and general network access.
 Codex sandbox cannot reach `api.xlimit.org`
 
 Run the wrapper from a terminal with network access, or configure the agent environment so it can make the outbound HTTPS request.
+
+Assistant gives generic advice
+
+Paste one of the phase prompts from `examples/` directly into the session and ensure the instruction to call `~/xlimit-client/xlimit_context.sh` is present.
 
 Missing `subfinder` or `httpx`
 

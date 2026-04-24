@@ -1,17 +1,20 @@
 # Codex Triage Prompt
 
-Use the existing recon artifacts I provide. Do not rediscover what is already known.
+Use this as the overall triage instruction for a local assistant session after running xLimit Recon on an authorized target.
 
 Constraints:
+- Keep all work within authorized scope.
 - Use existing recon artifacts as the primary source of truth.
-- Do not start broad rediscovery or enumeration.
-- Make live GET or HEAD requests only if clarification is truly needed.
-- Include the required custom header on any live request.
-- Do not start async fuzzing, content discovery, brute force, or scanner runs.
-- Do not label anything as a finding in this triage phase.
-- Rank the top 3-5 surfaces by likely assessment value.
-- Separate easy wins from likely rabbit holes.
-- Write a short summary with the best next manual checks.
+- Use xLimit hosted retrieval when helpful:
+  ~/xlimit-client/xlimit_context.sh "<full task prompt>"
+- Do not rediscover what is already known.
+- Do not start broad fuzzing, brute force, content discovery, or scanner runs unless explicitly approved.
+- Include the required tracking header on every live request if one is provided.
+- Do not claim findings without concrete reproduction evidence.
 
-Task:
-Review the provided artifacts, rank the top surfaces, explain why each matters, and propose the safest next manual validation steps.
+Workflow:
+- Start with Phase 1 using `examples/phase_1_rank_surfaces.md`.
+- Continue to Phase 2 only after ranking is complete.
+- Continue to Phase 2.5 only after inventory is complete.
+- Continue to Phase 3 only after there is a concrete plan.
+- After each phase, produce a short summary that can be saved and reused in the next phase.

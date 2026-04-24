@@ -1,20 +1,20 @@
-# Recon Summary Prompt
+# Recon-to-xLimit Launcher Prompt
 
-Use xLimit hosted retrieval if helpful.
+Use this when starting a local assistant session after running xLimit Recon.
 
-I am going to paste `xlimit_summary.txt` from an authorized xLimit Recon run.
+Prompt:
 
-Based on the summary:
-- Rank the top 3-5 surfaces by likely assessment value.
-- Explain why each surface matters.
-- Identify likely easy wins versus rabbit holes.
-- Suggest the best next manual checks for the highest-value hosts.
-- Keep recommendations within the authorized scope represented by the recon summary.
-- Treat xLimit retrieval as advisory context, not proof by itself.
-- Do not call anything a confirmed finding without manual validation evidence.
+I have local xLimit Recon artifacts for an authorized target.
 
-Recon summary:
+Target: <TARGET>
+Recon directory: <RECON_DIR>
+Required tracking header, if any: <CUSTOM_HEADER_OR_NONE>
 
-```text
-PASTE_XLIMIT_SUMMARY_TXT_HERE
-```
+Use existing recon artifacts first.
+Use xLimit hosted retrieval if helpful:
+~/xlimit-client/xlimit_context.sh "<full task prompt>"
+
+Do not rediscover what is already known.
+Do not start broad fuzzing or scanner runs unless I explicitly approve it.
+Start with Phase 1 ranking using examples/phase_1_rank_surfaces.md.
+After each phase, produce a short summary I can save and reuse in the next phase.
