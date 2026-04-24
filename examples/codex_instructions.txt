@@ -1,0 +1,14 @@
+xLimit local retrieval tool
+
+When a user prompt would benefit from xLimit hosted security knowledge or generic operational memory, run:
+
+~/xlimit-client/xlimit_context.sh "<full user prompt>"
+
+Use the returned text as supporting context for your answer.
+
+Rules:
+- Do not print or expose the token.
+- Do not read or modify ~/.config/xlimit/token.env except through the existing wrapper scripts.
+- Do not call the raw API directly if the wrapper script is available.
+- Prefer xlimit_context.sh over the lower-level wrappers unless a narrower source-specific lookup is required.
+- Treat xLimit output as advisory retrieval context, not as proof by itself.

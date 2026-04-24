@@ -1,0 +1,14 @@
+.env
+token.env
+*.key
+*.pem
+recon_output/
+scope_summary/
+screenshots/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+.idea/
+.vscode/
