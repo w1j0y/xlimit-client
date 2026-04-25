@@ -1,6 +1,6 @@
 # xLimit Client
 
-xLimit Client provides local client tools for approved users to query hosted xLimit retrieval from terminal agents such as Codex.
+xLimit Client provides local client tools for approved users to query hosted xLimit retrieval from terminal agents such as Codex, Claude Code, and other local assistant workflows.
 
 Retrieval returns short snippets through the xLimit API. xLimit does not provide direct access to raw source files.
 
@@ -84,9 +84,9 @@ The installer does not require `sudo`. It copies client wrappers into `~/xlimit-
 ~/xlimit-client/xlimit_context.sh "I found a public GraphQL endpoint with introspection enabled. Help me think through safe next tests."
 ```
 
-## Using xLimit with Codex
+## Using xLimit with Codex or Claude Code
 
-Add these instructions to your project or session instructions:
+Add these instructions to your Codex, Claude Code, or local assistant session instructions:
 
 ```text
 Use xLimit hosted retrieval when the task would benefit from xLimit security knowledge or generic operational memory.
@@ -104,16 +104,46 @@ Rules:
 - Treat xLimit output as advisory retrieval context, not as proof by itself.
 ```
 
+For Claude Code, you can paste the same instruction at the start of the session. If you want to force retrieval for a specific task, phrase the prompt explicitly:
+
+```text
+You must use xLimit hosted retrieval before answering this task.
+
+Run this exact command first:
+~/xlimit-client/xlimit_context.sh "<full user prompt>"
+
+After the command returns, use the returned xLimit context as supporting input and then answer.
+```
+
+For screenshots, demos, or recordings where you do not want Claude Code to show account details or the current working directory, start it with:
+
+~~~bash
+IS_DEMO=1 CLAUDE_CODE_HIDE_CWD=1 claude
+~~~
+
 ## Installing Codex
 
 Install the official Codex CLI:
 
-```bash
+~~~bash
 npm i -g @openai/codex
 codex
-```
+~~~
 
 Codex can use ChatGPT account sign-in or an API key depending on your setup. Follow the official OpenAI Codex documentation if installation or authentication changes.
+
+## Installing Claude Code
+
+Install the official Claude Code CLI:
+
+~~~bash
+npm install -g @anthropic-ai/claude-code
+claude
+~~~
+
+Claude Code requires Node.js 18 or later when installed through npm. Follow the official Anthropic Claude Code documentation if installation or authentication changes.
+
+---
 
 ## Model/provider note
 
@@ -136,9 +166,9 @@ python3 recon/xlimit_recon.py -d example.com --skip-js-scan
 
 Use `--custom-header` when an authorized program requires a tracking header. The header is applied to supported live requests and generated commands.
 
-## Using xLimit Recon with Codex and xLimit hosted retrieval
+## Using xLimit Recon with Codex, Claude Code, and xLimit hosted retrieval
 
-The most effective workflow is not only pasting `xlimit_summary.txt` and asking a broad follow-up. A stronger workflow is to run phased prompts where Codex or another local terminal agent:
+The most effective workflow is not only pasting `xlimit_summary.txt` and asking a broad follow-up. A stronger workflow is to run phased prompts where Codex, Claude Code, or another local terminal agent:
 
 - Uses existing local recon artifacts under `recon_output/` first.
 - Incorporates optional user-maintained notes or current phase notes when provided.
@@ -174,7 +204,7 @@ Recommended workflow:
    recon_output/<target>_<timestamp>/dashboard.html
    ```
 
-3. Start Codex in the project or workspace where the `recon_output/` directory exists.
+3. Start Codex, Claude Code, or another local terminal assistant in the project or workspace where the `recon_output/` directory exists.
 
 4. Add the xLimit client instruction:
 
