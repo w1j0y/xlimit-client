@@ -10,7 +10,7 @@ Retrieval returns short snippets through the xLimit API. xLimit does not provide
 - `client/xlimit_search_text.sh`: readable terminal output wrapper.
 - `client/xlimit_context.sh`: hosted retrieval context wrapper for local assistants.
 - `recon/xlimit_recon.py`: local authorized reconnaissance and triage helper.
-- `examples/`: Codex and recon triage prompt templates.
+- `examples/`: Codex, recon triage, and vibe-coder web/API testing prompt templates.
 
 ## Authorized use only
 
@@ -120,6 +120,37 @@ For screenshots, demos, or recordings where you do not want Claude Code to show 
 ~~~bash
 IS_DEMO=1 CLAUDE_CODE_HIDE_CWD=1 claude
 ~~~
+
+## Vibe-coder web/API testing prompts
+
+If you are building a website or API with a coding agent and want a security sanity check before going live, use the prompt templates in:
+
+```text
+examples/vibe_unauth_testing.md
+examples/vibe_auth_testing.md
+```
+
+Use the unauthenticated prompt when the target can be tested without login:
+
+```text
+examples/vibe_unauth_testing.md
+```
+
+Use the authenticated prompt when you have a test account, bearer/session token, or an authenticated browser Cookie header:
+
+```text
+examples/vibe_auth_testing.md
+```
+
+These prompts are designed to make Codex or Claude Code:
+
+- use xLimit hosted retrieval first
+- map the web/API attack surface
+- report only evidence-backed findings
+- avoid speculative scanner-style output
+- generate a copy-paste remediation prompt for your coding agent
+
+Only test applications you own or are explicitly authorized to assess. Do not paste real tokens, passwords, or cookies into committed files or shared reports.
 
 ## Installing Codex
 
@@ -249,6 +280,7 @@ xLimit Recon writes output under `recon_output/<target>_<timestamp>/`.
 ## Security notes
 
 - Keep `~/.config/xlimit/token.env` private.
+- Treat browser cookies, bearer tokens, OAuth tokens, and session headers like passwords. If using `examples/vibe_auth_testing.md`, prefer temporary test accounts or temporary sessions and redact secrets from reports.
 - Do not commit tokens, `.env` files, recon outputs, screenshots, scope files, reports, private notes, or raw source material.
 - Review generated recon output before sharing it outside an authorized team.
 - Keep live testing inside the written scope and rules of engagement.
