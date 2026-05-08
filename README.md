@@ -31,8 +31,13 @@ For xLimit Recon:
 
 - Python 3
 - Required external tools: `subfinder`, `httpx`
-- Optional external tools: `amass`, `gowitness`, `whatweb`, `nmap`, `feroxbuster`, `ffuf`, `gobuster`, `nuclei`, `paramspider`, `dirsearch`, `wpscan`
-- Optional Python packages: `requests`, `beautifulsoup4`
+- Recommended optional external tools: `amass`, `gowitness`, `whatweb`, `nmap`, `feroxbuster`, `ffuf`, `gobuster`, `nuclei`, `paramspider`, `dirsearch`, `wpscan`, `assetfinder`, `github-subdomains`, `chaos`, `dnsx`, `puredns`, `shuffledns`, `massdns`, `alterx`, `dnsgen`, `gau`, `waybackurls`, `arjun`, `masscan`, `asnmap`
+- Optional Python packages: `requests`, `beautifulsoup4`, `mmh3`
+- Optional environment variables:
+  - `GITHUB_TOKEN` for `github-subdomains`
+  - `PDCP_API_KEY` for ProjectDiscovery `chaos`
+
+`subfinder` and `httpx` are the minimum required tools. The optional tools improve coverage for subdomain discovery, DNS resolution, permutation, URL collection, crawling, screenshots, fingerprinting, content discovery, and port scanning.
 
 ### Optional recon tool installer
 
@@ -44,11 +49,41 @@ bash scripts/install_recon_tools.sh --core
 bash scripts/install_recon_tools.sh --full
 ```
 
-`--core` installs the required recon tools where possible.
+`--core` installs the minimum required recon tools where possible:
 
-`--full` also attempts to install optional helpers.
+```text
+subfinder
+httpx
+```
 
-Review the script before running it because it may use `sudo` and install system packages.
+`--full` attempts to install the full local recon helper stack checked by `xlimit_recon.py`, including DNS tools, URL collection tools, content discovery tools, screenshot/fingerprinting tools, port scanning tools, and Python helper packages.
+
+Review the script before running it because it may use `sudo`, install system packages, install Go tools into `~/go/bin`, install Python CLI tools through `pipx`, and build `massdns` from source.
+
+After running the installer, reload your shell path:
+
+```bash
+source ~/.bashrc
+```
+
+or open a new terminal.
+
+Then verify:
+
+```bash
+which subfinder
+which httpx
+python3 -c "import requests, bs4, mmh3; print('python deps ok')"
+```
+
+Some optional tools require API keys even after installation:
+
+```bash
+export GITHUB_TOKEN="your_github_token"
+export PDCP_API_KEY="your_projectdiscovery_api_key"
+```
+
+Without those keys, `github-subdomains` and `chaos` may install correctly but skip collection.
 
 ## Getting your xLimit API token
 
@@ -117,9 +152,9 @@ After the command returns, use the returned xLimit context as supporting input a
 
 For screenshots, demos, or recordings where you do not want Claude Code to show account details or the current working directory, start it with:
 
-~~~bash
+```bash
 IS_DEMO=1 CLAUDE_CODE_HIDE_CWD=1 claude
-~~~
+```
 
 ## Vibe-coder web/API testing prompts
 
@@ -156,10 +191,10 @@ Only test applications you own or are explicitly authorized to assess. Do not pa
 
 Install the official Codex CLI:
 
-~~~bash
+```bash
 npm i -g @openai/codex
 codex
-~~~
+```
 
 Codex can use ChatGPT account sign-in or an API key depending on your setup. Follow the official OpenAI Codex documentation if installation or authentication changes.
 
@@ -167,10 +202,10 @@ Codex can use ChatGPT account sign-in or an API key depending on your setup. Fol
 
 Install the official Claude Code CLI:
 
-~~~bash
+```bash
 npm install -g @anthropic-ai/claude-code
 claude
-~~~
+```
 
 Claude Code requires Node.js 18 or later when installed through npm. Follow the official Anthropic Claude Code documentation if installation or authentication changes.
 
@@ -193,6 +228,20 @@ python3 recon/xlimit_recon.py -d example.com --deep --run-nmap
 python3 recon/xlimit_recon.py --scope scope.csv --bounty-only
 python3 recon/xlimit_recon.py -d example.com --custom-header "X-Bug-Bounty: researcher123"
 python3 recon/xlimit_recon.py -d example.com --skip-js-scan
+```
+
+Before first use on a fresh Kali/Debian/Ubuntu machine, install the local recon dependencies:
+
+```bash
+bash scripts/install_recon_tools.sh --full
+source ~/.bashrc
+```
+
+For a minimal install:
+
+```bash
+bash scripts/install_recon_tools.sh --core
+source ~/.bashrc
 ```
 
 Use `--custom-header` when an authorized program requires a tracking header. The header is applied to supported live requests and generated commands.
@@ -508,7 +557,7 @@ If the assistant cannot access the network, run the command manually and paste t
 
 ---
 
-## Missing `subfinder` or `httpx`
+## Missing recon tools
 
 `xLimit Recon` requires:
 
@@ -527,17 +576,31 @@ which httpx
 If they are missing, use the optional installer:
 
 ```bash
-bash scripts/install_recon_tools.sh --help
 bash scripts/install_recon_tools.sh --core
 ```
 
-For a fuller local recon environment:
+For a fuller local recon environment with optional helpers:
 
 ```bash
 bash scripts/install_recon_tools.sh --full
 ```
 
-Review the installer before running it because it may use `sudo` and install system packages.
+After installation, reload your shell:
+
+```bash
+source ~/.bashrc
+```
+
+Then rerun the pre-flight check or recon command.
+
+Some optional tools require API keys even after installation:
+
+```bash
+export GITHUB_TOKEN="your_github_token"
+export PDCP_API_KEY="your_projectdiscovery_api_key"
+```
+
+Without those keys, `github-subdomains` and `chaos` may install correctly but skip collection.
 
 ---
 
