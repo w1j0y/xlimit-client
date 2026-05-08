@@ -37,7 +37,7 @@ For xLimit Recon:
   - `GITHUB_TOKEN` for `github-subdomains`
   - `PDCP_API_KEY` for ProjectDiscovery `chaos`
 
-`subfinder` and `httpx` are the minimum required tools. The optional tools improve coverage for subdomain discovery, DNS resolution, permutation, URL collection, crawling, screenshots, fingerprinting, content discovery, and port scanning.
+`subfinder` and `httpx` are the minimum required tools. The optional tools improve coverage for subdomain discovery, DNS resolution, permutation, URL collection, crawling, screenshots, fingerprinting, content discovery, parameter discovery, archive enumeration, and port scanning.
 
 ### Optional recon tool installer
 
@@ -56,7 +56,7 @@ subfinder
 httpx
 ```
 
-`--full` attempts to install the full local recon helper stack checked by `xlimit_recon.py`, including DNS tools, URL collection tools, content discovery tools, screenshot/fingerprinting tools, port scanning tools, and Python helper packages.
+`--full` attempts to install the full local recon helper stack checked by `xlimit_recon.py`, including DNS tools, URL collection tools, content discovery tools, screenshot/fingerprinting tools, parameter discovery tools, archive enumeration tools, port scanning tools, and Python helper packages.
 
 Review the script before running it because it may use `sudo`, install system packages, install Go tools into `~/go/bin`, install Python CLI tools through `pipx`, and build `massdns` from source.
 
@@ -228,6 +228,8 @@ python3 recon/xlimit_recon.py -d example.com --deep --run-nmap
 python3 recon/xlimit_recon.py --scope scope.csv --bounty-only
 python3 recon/xlimit_recon.py -d example.com --custom-header "X-Bug-Bounty: researcher123"
 python3 recon/xlimit_recon.py -d example.com --skip-js-scan
+python3 recon/xlimit_recon.py -d example.com --skip-archives
+python3 recon/xlimit_recon.py -d example.com --deep-archives
 ```
 
 Before first use on a fresh Kali/Debian/Ubuntu machine, install the local recon dependencies:
@@ -245,6 +247,29 @@ source ~/.bashrc
 ```
 
 Use `--custom-header` when an authorized program requires a tracking header. The header is applied to supported live requests and generated commands.
+
+### Archive enumeration behavior
+
+Archive enumeration is bounded by default to keep recon fast on large targets.
+
+By default, xLimit Recon:
+
+- deduplicates archive enumeration by normalized root/scope domain instead of running expensive archive commands for every live subdomain
+- uses a lightweight `gau` mode with the `wayback` provider
+- falls back to `waybackurls` if `gau` fails or times out
+- creates downstream archive files even when archive enumeration is skipped or returns no URLs
+
+Use `--deep-archives` when you intentionally want heavier archive collection. Deep archive mode uses the larger provider set and may take longer on large targets.
+
+Use `--skip-archives` to skip archive enumeration completely while still allowing later phases to continue safely.
+
+### Parameter discovery behavior
+
+Parameter discovery supports both `arjun` and `paramspider`.
+
+`paramspider` CLI behavior varies by installed version. xLimit Recon detects whether the installed version supports output flags and falls back to compatible behavior when it does not. This avoids failures from versions that do not support `-o`.
+
+If `paramspider` fails or produces no output, xLimit Recon logs the issue and continues. Arjun behavior remains unchanged.
 
 ## Using xLimit Recon with Codex, Claude Code, and xLimit hosted retrieval
 
@@ -325,6 +350,10 @@ xLimit Recon writes output under `recon_output/<target>_<timestamp>/`.
 - `playbook_commands.sh`: generated command examples.
 - `xlimit_summary.json`: structured summary intended for assistant workflows.
 - `xlimit_summary.txt`: compact summary suitable for pasting into a local assistant.
+- `archive_urls.txt`: merged archive URLs collected during archive enumeration.
+- `archive_urls_interesting.txt`: filtered archive URLs that may be worth manual review.
+- `archive_urls/`: per-domain archive enumeration output files, when archive enumeration is enabled.
+- `params/`: parameter discovery output files, when parameter discovery tools return results.
 
 ## Security notes
 
@@ -604,6 +633,46 @@ Without those keys, `github-subdomains` and `chaos` may install correctly but sk
 
 ---
 
+## Archive enumeration is slow or timing out
+
+Archive enumeration can be slow on large targets because public archive providers may return huge datasets, rate-limit requests, or hang.
+
+By default, xLimit Recon uses a bounded archive mode and deduplicates work by root/scope domain. For a faster run, skip archive enumeration:
+
+```bash
+python3 recon/xlimit_recon.py -d example.com --skip-archives
+```
+
+For heavier archive collection, opt in explicitly:
+
+```bash
+python3 recon/xlimit_recon.py -d example.com --deep-archives
+```
+
+If archive enumeration fails or times out, xLimit Recon should continue and still create the downstream archive output files.
+
+---
+
+## ParamSpider shows `unrecognized arguments: -o`
+
+Older or packaged ParamSpider versions may not support `-o`.
+
+Current xLimit Recon detects ParamSpider capabilities at runtime and falls back to compatible behavior. If you still see this error, confirm that you are running the updated script:
+
+```bash
+python3 recon/xlimit_recon.py --help | grep -E "archives|deep-archives|skip-archives"
+```
+
+Also check the installed ParamSpider help:
+
+```bash
+paramspider -h
+```
+
+If needed, continue with Arjun-only results or rerun after updating the recon script.
+
+---
+
 ## Permission denied on scripts
 
 If the installed client scripts cannot run, fix permissions:
@@ -738,6 +807,12 @@ examples/phase_1_rank_surfaces.md
 ```
 
 The goal is not to test everything. The goal is to decide what is worth time, what is noise, and when to stop.
+
+For large targets where archive enumeration is slowing down the run, use:
+
+```bash
+python3 recon/xlimit_recon.py -d example.com --skip-archives
+```
 
 ---
 

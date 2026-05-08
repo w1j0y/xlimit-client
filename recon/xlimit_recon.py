@@ -20,7 +20,7 @@ Usage:
     python3 recon.py -d example.com --monitor
 """
 
-import subprocess, json, os, sys, argparse, shutil, datetime, time, csv, re, shlex
+import subprocess, json, os, sys, argparse, shutil, datetime, time, csv, re, shlex, tempfile
 import math, hashlib, logging
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -46,6 +46,14 @@ try:
 except ImportError:
     HAS_BS4 = False
 
+try:
+    import mmh3
+    import base64
+    HAS_MMH3 = True
+except ImportError:
+    HAS_MMH3 = False
+    import base64
+
 # ===========================================================================
 # CONFIGURATION
 # ===========================================================================
@@ -70,6 +78,12 @@ TOOLS_OPTIONAL = [
     "amass", "gowitness", "whatweb", "nmap",
     "feroxbuster", "ffuf", "gobuster", "nuclei",
     "paramspider", "dirsearch", "wpscan",
+    # Enumeration expansion
+    "assetfinder", "github-subdomains", "chaos",
+    "dnsx", "puredns", "shuffledns", "massdns",
+    "alterx", "dnsgen",
+    "gau", "waybackurls",
+    "arjun", "masscan", "asnmap",
 ]
 WORDLISTS = {
     "dir_common":    "/usr/share/wordlists/dirb/common.txt",
@@ -78,6 +92,8 @@ WORDLISTS = {
     "seclists_raft": "/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt",
     "seclists_api":  "/usr/share/seclists/Discovery/Web-Content/api/api-endpoints.txt",
     "fuzz_params":   "/usr/share/seclists/Discovery/Web-Content/burp-parameter-names.txt",
+    "dns_brute_small": "/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt",
+    "dns_brute_large": "/usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt",
 }
 
 CUSTOM_HEADER = ""
@@ -134,6 +150,14 @@ def check_tool(name):
     return shutil.which(name) is not None
 
 
+@dataclass
+class CommandResult:
+    returncode: int
+    stdout: str = ""
+    stderr: str = ""
+    timed_out: bool = False
+
+
 def _command_repr(cmd: Command) -> str:
     if isinstance(cmd, str):
         return cmd
@@ -156,8 +180,16 @@ def read_jsonl(path: Path) -> List[dict]:
     return rows
 
 
-def run_command(cmd: Command, timeout=600):
-    cmd_text = _command_repr(cmd)
+def write_lines(path: Path, lines: Sequence[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) if lines else "")
+
+
+def ensure_empty_file(path: Path) -> None:
+    write_lines(path, [])
+
+
+def run_command_result(cmd: Command, timeout=600, cwd: Optional[Path] = None) -> CommandResult:
     try:
         r = subprocess.run(
             cmd,
@@ -165,16 +197,139 @@ def run_command(cmd: Command, timeout=600):
             capture_output=True,
             text=True,
             timeout=timeout,
+            cwd=str(cwd) if cwd else None,
         )
-        if r.returncode != 0 and r.stderr:
-            log_warning(f"stderr: {r.stderr.strip()[:200]}")
-        return [l.strip() for l in r.stdout.strip().split("\n") if l.strip()]
-    except subprocess.TimeoutExpired:
-        log_warning(f"Timed out ({timeout}s): {cmd_text[:80]}")
-        return []
+        return CommandResult(
+            returncode=r.returncode,
+            stdout=r.stdout or "",
+            stderr=r.stderr or "",
+            timed_out=False,
+        )
+    except subprocess.TimeoutExpired as e:
+        return CommandResult(
+            returncode=-1,
+            stdout=e.stdout or "",
+            stderr=e.stderr or "",
+            timed_out=True,
+        )
     except Exception as e:
         log_error(f"Command failed: {e}")
+        return CommandResult(returncode=-1, stderr=str(e), timed_out=False)
+
+
+def run_command(cmd: Command, timeout=600):
+    cmd_text = _command_repr(cmd)
+    result = run_command_result(cmd, timeout=timeout)
+    if result.timed_out:
+        log_warning(f"Timed out ({timeout}s): {cmd_text[:80]}")
         return []
+    if result.returncode != 0 and result.stderr:
+        log_warning(f"stderr: {result.stderr.strip()[:200]}")
+    return [l.strip() for l in result.stdout.strip().split("\n") if l.strip()]
+
+
+def normalize_host(value: str) -> str:
+    candidate = (value or "").strip()
+    if not candidate:
+        return ""
+    parsed = urlparse(candidate if "://" in candidate else f"//{candidate}")
+    hostname = parsed.hostname or candidate.split("/")[0].split("?")[0].split("#")[0]
+    return hostname.split(":")[0].strip(".").lower()
+
+
+def scope_root_domain(value: str) -> str:
+    hostname = normalize_host(value)
+    if not hostname:
+        return ""
+    if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", hostname) or ":" in hostname:
+        return hostname
+
+    parts = hostname.split(".")
+    if len(parts) <= 2:
+        return hostname
+
+    common_multi_label_suffixes = {
+        "co.uk", "org.uk", "gov.uk", "ac.uk",
+        "com.au", "net.au", "org.au",
+        "co.jp", "com.br", "com.mx",
+    }
+    suffix = ".".join(parts[-2:])
+    if suffix in common_multi_label_suffixes and len(parts) >= 3:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
+@lru_cache(maxsize=1)
+def paramspider_capabilities() -> Dict[str, bool]:
+    caps = {"supports_output": False, "supports_silent": False}
+    if not check_tool("paramspider"):
+        return caps
+
+    result = run_command_result(["paramspider", "-h"], timeout=20)
+    help_text = "\n".join(part for part in [result.stdout, result.stderr] if part).lower()
+    if not help_text:
+        return caps
+
+    caps["supports_output"] = bool(re.search(r"(^|[\s\[])(-o|--output)([\s,\]]|$)", help_text))
+    caps["supports_silent"] = bool(re.search(r"(^|[\s\[])-s([\s,\]]|$)", help_text))
+    return caps
+
+
+def locate_paramspider_output(workdir: Path, hostname: str) -> Optional[Path]:
+    safe_name = re.sub(r'[^a-zA-Z0-9._-]', '_', hostname)
+    candidate_names = {
+        f"{hostname}.txt",
+        f"{safe_name}.txt",
+        f"{hostname.replace('.', '_')}.txt",
+    }
+
+    candidates: List[Path] = []
+    for dirname in ("results", "output", "."):
+        base = workdir / dirname
+        for name in candidate_names:
+            path = base / name
+            if path.exists() and path.is_file():
+                candidates.append(path)
+
+    if not candidates:
+        for path in workdir.rglob("*.txt"):
+            if path.is_file():
+                candidates.append(path)
+
+    if not candidates:
+        return None
+
+    candidates = sorted(set(candidates), key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def run_paramspider_for_host(hostname: str, output_file: Path, timeout: int = 120) -> List[str]:
+    caps = paramspider_capabilities()
+    with tempfile.TemporaryDirectory(prefix="xlimit_paramspider_") as tmpdir:
+        tmp_path = Path(tmpdir)
+        cmd = ["paramspider", "-d", hostname]
+        if caps["supports_output"]:
+            cmd.extend(["-o", f"{hostname}.txt"])
+        if caps["supports_silent"]:
+            cmd.append("-s")
+
+        result = run_command_result(cmd, timeout=timeout, cwd=tmp_path)
+        if result.returncode != 0:
+            stderr = (result.stderr or result.stdout).strip()
+            if stderr:
+                log_warning(f"paramspider ({hostname}) stderr: {stderr[:200]}")
+            else:
+                log_warning(f"paramspider failed for {hostname} with exit code {result.returncode}")
+            return []
+
+        discovered = locate_paramspider_output(tmp_path, hostname)
+        if not discovered:
+            log_warning("paramspider completed but no output file was found")
+            return []
+
+        lines = read_nonempty_lines(discovered)
+        write_lines(output_file, lines)
+        return lines
 
 def ensure_output_dir(domain):
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -326,7 +481,7 @@ def filter_out_of_scope(results, oos):
 # PHASE 1: SUBDOMAIN ENUMERATION
 # ===========================================================================
 
-def subdomain_enumeration(domain, output_dir, deep=False):
+def subdomain_enumeration(domain, output_dir, deep=False, deep_dns=False):
     log_phase("PHASE 1: Subdomain Enumeration")
     all_subs = set()
 
@@ -334,6 +489,7 @@ def subdomain_enumeration(domain, output_dir, deep=False):
     if normalized_domain and "." in normalized_domain:
         all_subs.add(normalized_domain)
 
+    # --- subfinder ---
     log_info("Running subfinder...")
     sf = output_dir / "subfinder.txt"
     cmd = ["subfinder", "-d", domain, "-silent", "-o", str(sf)]
@@ -345,6 +501,7 @@ def subdomain_enumeration(domain, output_dir, deep=False):
         all_subs.update(s)
         log_success(f"Subfinder: {len(s)} subdomains")
 
+    # --- amass (deep only) ---
     if deep and check_tool("amass"):
         log_info("Running amass (deep passive)...")
         af = output_dir / "amass.txt"
@@ -355,11 +512,251 @@ def subdomain_enumeration(domain, output_dir, deep=False):
             all_subs.update(s)
             log_success(f"Amass: {len(new)} additional")
 
+    # --- crt.sh Certificate Transparency ---
+    if HAS_REQUESTS:
+        log_info("Querying crt.sh...")
+        crtsh_file = output_dir / "crtsh.txt"
+        try:
+            _sess = requests.Session()
+            _sess.verify = False
+            r = _sess.get(
+                f"https://crt.sh/?q=%25.{domain}&output=json",
+                timeout=30,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            if r.status_code == 200:
+                crt_subs = set()
+                for entry in r.json():
+                    for name in entry.get("name_value", "").split("\n"):
+                        name = name.strip().lower().lstrip("*.")
+                        if name and "." in name:
+                            crt_subs.add(name)
+                crtsh_file.write_text("\n".join(sorted(crt_subs)))
+                new_crt = crt_subs - all_subs
+                all_subs.update(crt_subs)
+                log_success(f"crt.sh: {len(crt_subs)} subdomains ({len(new_crt)} new)")
+        except Exception as e:
+            log_warning(f"crt.sh query failed: {e}")
+    else:
+        log_warning("crt.sh skipped: requests not installed")
+
+    # --- assetfinder ---
+    if check_tool("assetfinder"):
+        log_info("Running assetfinder...")
+        af_file = output_dir / "assetfinder.txt"
+        result = run_command(["assetfinder", "--subs-only", domain], timeout=120)
+        if result:
+            filtered = [r for r in result if domain in r]
+            af_file.write_text("\n".join(filtered))
+            new_af = set(filtered) - all_subs
+            all_subs.update(filtered)
+            log_success(f"assetfinder: {len(filtered)} subdomains ({len(new_af)} new)")
+    else:
+        log_warning("assetfinder not installed (optional)")
+
+    # --- github-subdomains (requires GITHUB_TOKEN env var) ---
+    # Set GITHUB_TOKEN environment variable for GitHub subdomain enumeration
+    github_token = os.environ.get("GITHUB_TOKEN", "")
+    if check_tool("github-subdomains") and github_token:
+        log_info("Running github-subdomains...")
+        gh_file = output_dir / "github.txt"
+        run_command(
+            ["github-subdomains", "-d", domain, "-t", github_token, "-o", str(gh_file)],
+            timeout=180,
+        )
+        if gh_file.exists():
+            s = read_nonempty_lines(gh_file)
+            new_gh = set(s) - all_subs
+            all_subs.update(s)
+            log_success(f"github-subdomains: {len(s)} subdomains ({len(new_gh)} new)")
+    elif check_tool("github-subdomains"):
+        log_warning("github-subdomains installed but GITHUB_TOKEN not set — skipping")
+
+    # --- chaos (requires PDCP_API_KEY env var) ---
+    # Set PDCP_API_KEY environment variable for Project Discovery chaos dataset
+    pdcp_key = os.environ.get("PDCP_API_KEY", "")
+    if check_tool("chaos") and pdcp_key:
+        log_info("Running chaos...")
+        chaos_file = output_dir / "chaos.txt"
+        run_command(
+            ["chaos", "-d", domain, "-silent", "-o", str(chaos_file)],
+            timeout=120,
+        )
+        if chaos_file.exists():
+            s = read_nonempty_lines(chaos_file)
+            new_chaos = set(s) - all_subs
+            all_subs.update(s)
+            log_success(f"chaos: {len(s)} subdomains ({len(new_chaos)} new)")
+    elif check_tool("chaos"):
+        log_warning("chaos installed but PDCP_API_KEY not set — skipping")
+
+    # --- DNS brute force (--deep only) ---
+    if deep:
+        brute_tool = None
+        if check_tool("puredns"):
+            brute_tool = "puredns"
+        elif check_tool("shuffledns"):
+            brute_tool = "shuffledns"
+
+        if brute_tool:
+            wordlist = WORDLISTS.get("dns_brute_small", "")
+            if deep_dns:
+                wordlist = WORDLISTS.get("dns_brute_large", wordlist)
+            if wordlist and Path(wordlist).exists():
+                log_info(f"DNS brute force with {brute_tool} ({Path(wordlist).name})...")
+                brute_file = output_dir / "dns_brute.txt"
+                if brute_tool == "puredns":
+                    run_command(
+                        ["puredns", "bruteforce", wordlist, domain, "-o", str(brute_file)],
+                        timeout=600,
+                    )
+                else:
+                    run_command(
+                        ["shuffledns", "-d", domain, "-w", wordlist, "-o", str(brute_file)],
+                        timeout=600,
+                    )
+                if brute_file.exists():
+                    s = read_nonempty_lines(brute_file)
+                    new_brute = set(s) - all_subs
+                    all_subs.update(s)
+                    log_success(f"DNS brute ({brute_tool}): {len(s)} subdomains ({len(new_brute)} new)")
+            else:
+                log_warning(f"DNS brute wordlist not found: {wordlist}")
+        else:
+            log_warning("DNS brute skipped: neither puredns nor shuffledns installed")
+
     combined = output_dir / "subdomains_all.txt"
     sorted_subs = sorted(all_subs)
     combined.write_text("\n".join(sorted_subs))
     log_success(f"Total unique subdomains: {len(sorted_subs)}")
     return sorted_subs
+
+# ===========================================================================
+# PHASE 1.5: SUBDOMAIN PERMUTATION GENERATION
+# ===========================================================================
+
+def permutation_step(output_dir: Path, deep: bool = False) -> Optional[Path]:
+    """Generate subdomain permutations from collected subdomains. Requires --deep."""
+    if not deep:
+        return None
+
+    combined = output_dir / "subdomains_all.txt"
+    if not combined.exists():
+        log_warning("Permutation step: subdomains_all.txt not found, skipping.")
+        return None
+
+    perm_file = output_dir / "permutations.txt"
+
+    if check_tool("alterx"):
+        log_phase("PHASE 1.5: Subdomain Permutation (alterx)")
+        log_info("Generating permutations with alterx...")
+        run_command(["alterx", "-l", str(combined), "-o", str(perm_file)], timeout=300)
+        if perm_file.exists():
+            lines = read_nonempty_lines(perm_file)
+            if len(lines) > 100000:
+                log_warning(f"Capping permutations at 100k (was {len(lines)})")
+                perm_file.write_text("\n".join(lines[:100000]))
+                lines = lines[:100000]
+            log_success(f"Permutations: {len(lines)} generated (alterx)")
+            return perm_file
+    elif check_tool("dnsgen"):
+        log_phase("PHASE 1.5: Subdomain Permutation (dnsgen)")
+        log_info("Generating permutations with dnsgen...")
+        result = run_command(f"dnsgen {str(combined)}", timeout=300)
+        if result:
+            capped = result[:100000]
+            perm_file.write_text("\n".join(capped))
+            log_success(f"Permutations: {len(capped)} generated (dnsgen)")
+            return perm_file
+    else:
+        log_warning("Permutation step: neither alterx nor dnsgen installed, skipping.")
+
+    return None
+
+
+# ===========================================================================
+# PHASE 1.7: DNS RESOLUTION LAYER
+# ===========================================================================
+
+def dns_resolution_step(output_dir: Path) -> List[str]:
+    """Resolve subdomains + permutations using dnsx or massdns.
+    Returns resolved hostname list to feed Phase 2 instead of raw names."""
+    combined = output_dir / "subdomains_all.txt"
+    perm_file = output_dir / "permutations.txt"
+    resolved_file = output_dir / "resolved.txt"
+    combined_input = output_dir / "_dns_resolve_input.txt"
+
+    if not combined.exists():
+        log_warning("DNS resolution: subdomains_all.txt not found.")
+        return []
+
+    all_names = set(read_nonempty_lines(combined))
+    if perm_file.exists():
+        all_names.update(read_nonempty_lines(perm_file))
+    all_names_sorted = sorted(all_names)
+    combined_input.write_text("\n".join(all_names_sorted))
+
+    log_phase("PHASE 1.7: DNS Resolution")
+    log_info(f"Resolving {len(all_names_sorted)} names...")
+
+    if check_tool("dnsx"):
+        # Try with wildcard detection first, fall back if flag unsupported
+        ret = run_command(
+            ["dnsx", "-l", str(combined_input), "-resp", "-silent", "-o", str(resolved_file)],
+            timeout=600,
+        )
+        if not resolved_file.exists() or not resolved_file.stat().st_size:
+            log_warning("dnsx produced no output — retrying without flags")
+            run_command(
+                ["dnsx", "-l", str(combined_input), "-silent", "-o", str(resolved_file)],
+                timeout=600,
+            )
+    elif check_tool("massdns"):
+        log_warning("massdns fallback active (no wildcard filtering).")
+        resolvers_candidates = [
+            "/usr/share/seclists/Miscellaneous/dns-resolvers.txt",
+            "/tmp/xlimit_resolvers.txt",
+        ]
+        resolvers_file = None
+        for c in resolvers_candidates:
+            if Path(c).exists():
+                resolvers_file = c
+                break
+        if not resolvers_file:
+            resolvers_file = "/tmp/xlimit_resolvers.txt"
+            Path(resolvers_file).write_text("8.8.8.8\n1.1.1.1\n9.9.9.9\n")
+        raw_out = output_dir / "_massdns_raw.txt"
+        run_command(
+            ["massdns", "-r", resolvers_file, "-t", "A", "-o", "S",
+             "-w", str(raw_out), str(combined_input)],
+            timeout=600,
+        )
+        if raw_out.exists():
+            hostnames_from_massdns = []
+            for line in read_nonempty_lines(raw_out):
+                parts = line.split()
+                if parts:
+                    h = parts[0].rstrip(".").lower()
+                    if h:
+                        hostnames_from_massdns.append(h)
+            resolved_file.write_text("\n".join(sorted(set(hostnames_from_massdns))))
+    else:
+        log_warning("DNS resolution: neither dnsx nor massdns installed. Phase 2 uses unresolved names.")
+        return []
+
+    if not resolved_file.exists() or not resolved_file.stat().st_size:
+        log_warning("DNS resolution produced no output. Phase 2 will use unresolved names.")
+        return []
+
+    hostnames = []
+    for line in read_nonempty_lines(resolved_file):
+        host = line.split()[0].rstrip(".").lower()
+        if host:
+            hostnames.append(host)
+    hostnames = sorted(set(hostnames))
+    log_success(f"DNS resolution: {len(hostnames)} names resolved")
+    return hostnames
+
 
 # ===========================================================================
 # PHASE 2: LIVE HOST DETECTION
@@ -452,6 +849,229 @@ def technology_fingerprint(live_hosts, output_dir):
     return tech
 
 # ===========================================================================
+# PHASE 4.5: ARCHIVE / WAYBACK ENUMERATION
+# ===========================================================================
+
+def archive_enumeration(
+    live_hosts: List[str],
+    output_dir: Path,
+    skip: bool = False,
+    deep_archives: bool = False,
+) -> dict:
+    """Enumerate historical URLs in a bounded way and keep downstream files stable."""
+    archive_dir = output_dir / "archive_urls"
+    archive_dir.mkdir(exist_ok=True)
+    merged_file = output_dir / "archive_urls.txt"
+    interesting_file = output_dir / "archive_urls_interesting.txt"
+    ensure_empty_file(merged_file)
+    ensure_empty_file(interesting_file)
+
+    empty_result = {
+        "total": 0,
+        "per_host": {},
+        "per_domain": {},
+        "interesting": 0,
+        "domains_attempted": 0,
+        "gau_urls": 0,
+        "waybackurls_urls": 0,
+        "failures": 0,
+    }
+
+    if skip:
+        log_info("Archive enumeration skipped (--skip-archive/--skip-archives).")
+        return empty_result
+
+    log_phase("PHASE 4.5: Archive Enumeration")
+
+    has_gau = check_tool("gau")
+    has_waybackurls = check_tool("waybackurls")
+    if not has_gau and not has_waybackurls:
+        log_warning("Neither gau nor waybackurls installed. Skipping archive enumeration.")
+        return empty_result
+
+    if not live_hosts:
+        log_warning("No live hosts for archive enumeration.")
+        return empty_result
+
+    all_urls: Set[str] = set()
+    per_host_counts: Dict[str, int] = {}
+    per_domain_counts: Dict[str, int] = {}
+    gau_url_count = 0
+    wayback_url_count = 0
+    failures = 0
+
+    interesting_patterns = [
+        "/api/", "/admin/", "/internal/", "/debug/", "?token=", "?key=",
+        ".bak", ".zip", ".sql", ".env", ".json", "/v1/", "/v2/",
+    ]
+
+    domain_to_hosts: Dict[str, Set[str]] = defaultdict(set)
+    for host_url in live_hosts:
+        hostname = normalize_host(host_url)
+        if not hostname:
+            continue
+        domain = scope_root_domain(hostname)
+        domain_to_hosts[domain].add(hostname)
+
+    providers = "wayback,otx,commoncrawl" if deep_archives else "wayback"
+    gau_timeout = 120 if deep_archives else 60
+    wayback_timeout = 45
+
+    for domain in sorted(domain_to_hosts):
+        safe_name = re.sub(r'[^a-zA-Z0-9._-]', '_', domain)
+        gau_file = archive_dir / f"archive_gau_{safe_name}.txt"
+        wayback_file = archive_dir / f"archive_waybackurls_{safe_name}.txt"
+        ensure_empty_file(gau_file)
+        ensure_empty_file(wayback_file)
+
+        domain_lines: List[str] = []
+        gau_failed = False
+
+        if has_gau:
+            gau_result = run_command_result(
+                ["gau", "--threads", "5", "--providers", providers, "--o", str(gau_file), domain],
+                timeout=gau_timeout,
+            )
+            if gau_result.timed_out:
+                failures += 1
+                gau_failed = True
+                log_warning(f"Archive enumeration timed out for {domain}; continuing with fallback or skipping.")
+            elif gau_result.returncode != 0:
+                failures += 1
+                gau_failed = True
+                stderr = (gau_result.stderr or gau_result.stdout).strip()
+                if stderr:
+                    log_warning(f"gau ({domain}) stderr: {stderr[:200]}")
+                else:
+                    log_warning(f"gau failed for {domain}; continuing with fallback or skipping.")
+
+            if not gau_failed and gau_file.exists():
+                domain_lines = read_nonempty_lines(gau_file)
+                if len(domain_lines) > 5000:
+                    domain_lines = domain_lines[:5000]
+                    write_lines(gau_file, domain_lines)
+                gau_url_count += len(domain_lines)
+
+        if (not domain_lines) and has_waybackurls and (gau_failed or not has_gau):
+            wb_result = run_command_result(["waybackurls", domain], timeout=wayback_timeout)
+            if wb_result.timed_out:
+                failures += 1
+                log_warning(f"waybackurls timed out for {domain}; skipping archive enumeration for this domain.")
+            elif wb_result.returncode != 0:
+                failures += 1
+                stderr = (wb_result.stderr or wb_result.stdout).strip()
+                if stderr:
+                    log_warning(f"waybackurls ({domain}) stderr: {stderr[:200]}")
+                else:
+                    log_warning(f"waybackurls failed for {domain}; skipping archive enumeration for this domain.")
+            else:
+                domain_lines = [line.strip() for line in wb_result.stdout.splitlines() if line.strip()]
+                if len(domain_lines) > 5000:
+                    domain_lines = domain_lines[:5000]
+                write_lines(wayback_file, domain_lines)
+                wayback_url_count += len(domain_lines)
+
+        unique_domain_lines = sorted(set(domain_lines))
+        if unique_domain_lines and gau_file.exists() and not gau_failed and has_gau:
+            write_lines(gau_file, unique_domain_lines)
+        elif not unique_domain_lines:
+            ensure_empty_file(gau_file)
+
+        all_urls.update(unique_domain_lines)
+        per_domain_counts[domain] = len(unique_domain_lines)
+        for hostname in domain_to_hosts[domain]:
+            per_host_counts[hostname] = len(unique_domain_lines)
+        if unique_domain_lines:
+            log_success(f"  {domain}: {len(unique_domain_lines)} archive URLs")
+
+    sorted_urls = sorted(all_urls)
+    write_lines(merged_file, sorted_urls)
+
+    interesting_urls = [u for u in sorted_urls if any(p in u for p in interesting_patterns)]
+    interesting_count = len(interesting_urls)
+    if interesting_urls:
+        write_lines(interesting_file, interesting_urls)
+        log_success(f"Interesting archive URLs: {interesting_count} -> archive_urls_interesting.txt")
+
+    log_success(
+        f"Archive enumeration: {len(sorted_urls)} unique URLs across {len(per_domain_counts)} domains"
+    )
+    log_info(
+        "  "
+        f"domains attempted: {len(per_domain_counts)} | "
+        f"gau URLs: {gau_url_count} | "
+        f"waybackurls URLs: {wayback_url_count} | "
+        f"total unique: {len(sorted_urls)} | "
+        f"timeouts/failures: {failures}"
+    )
+    return {
+        "total": len(sorted_urls),
+        "per_host": per_host_counts,
+        "per_domain": per_domain_counts,
+        "interesting": interesting_count,
+        "domains_attempted": len(per_domain_counts),
+        "gau_urls": gau_url_count,
+        "waybackurls_urls": wayback_url_count,
+        "failures": failures,
+    }
+
+
+# ===========================================================================
+# PHASE 4.7: FAVICON HASHING
+# ===========================================================================
+
+def favicon_hashing(live_hosts: List[str], output_dir: Path) -> dict:
+    """Compute mmh3 favicon hashes per host to cluster related assets."""
+    log_phase("PHASE 4.7: Favicon Hashing")
+
+    if not HAS_REQUESTS:
+        log_warning("requests not installed. Skipping favicon hashing.")
+        return {}
+    if not HAS_MMH3:
+        log_warning("mmh3 not installed. Skipping favicon hashing. Install: pip install mmh3")
+        return {}
+    if not live_hosts:
+        return {}
+
+    session = requests.Session()
+    session.verify = False
+    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+
+    favicons: dict = {}
+    hash_groups: dict = defaultdict(list)
+
+    for host_url in live_hosts:
+        if not host_url.startswith(('http://', 'https://')):
+            host_url = f"https://{host_url}"
+        favicon_url = host_url.rstrip('/') + '/favicon.ico'
+        try:
+            r = session.get(favicon_url, timeout=8, allow_redirects=True)
+            if r.status_code == 200 and r.content:
+                favicon_b64 = base64.encodebytes(r.content).decode()
+                favicon_hash = mmh3.hash(favicon_b64)
+                parsed = urlparse(host_url)
+                hostname = parsed.hostname or host_url
+                favicons[hostname] = favicon_hash
+                hash_groups[favicon_hash].append(hostname)
+                log_info(f"  {hostname}: favicon hash {favicon_hash}")
+        except Exception:
+            pass
+
+    favicons_file = output_dir / "favicons.json"
+    favicons_file.write_text(json.dumps({
+        "by_host": favicons,
+        "hash_groups": {str(k): v for k, v in hash_groups.items() if len(v) > 1},
+    }, indent=2))
+
+    log_success(f"Favicon hashing: {len(favicons)} hashes computed")
+    shared = {k: v for k, v in hash_groups.items() if len(v) > 1}
+    if shared:
+        log_info(f"  {len(shared)} shared favicon hash group(s) — likely related assets")
+
+    return {"by_host": favicons, "hash_groups": {str(k): v for k, v in hash_groups.items()}}
+
+
+# ===========================================================================
 # PHASE 5: JS SOURCE MAP SECRET SCANNING
 # ===========================================================================
 
@@ -525,6 +1145,45 @@ class JSMapScanResult:
     secrets_found: int = 0
     findings: list = field(default_factory=list)
     errors: list = field(default_factory=list)
+    endpoints: dict = field(default_factory=dict)
+
+
+def _extract_js_endpoints(js_content: str, source_host: str) -> dict:
+    """Extract API endpoints, paths, and GraphQL ops from a JS bundle."""
+    urls: set = set()
+    paths: set = set()
+    graphql_ops: set = set()
+
+    # Absolute URLs inside string literals
+    for m in re.finditer(r'https?://[a-zA-Z0-9._-]+(?:/[^\s"\'<>]*)?', js_content):
+        u = m.group(0).rstrip('.,;)')
+        if not any(junk in u for junk in ['data:', 'blob:', 'example.com']):
+            urls.add(u)
+
+    # Quoted relative paths (starts with /, inside quotes, no whitespace)
+    for m in re.finditer(r'["\'](/[a-zA-Z][^\s"\'<>]{2,})["\']', js_content):
+        p = m.group(1)
+        if len(p) < 4:
+            continue
+        if any(skip in p for skip in ['/_next/', '/static/', '/assets/']):
+            continue
+        paths.add(p)
+
+    # API-shaped paths (even outside quotes)
+    for m in re.finditer(r'(/(?:api|v\d+|rest|graphql|admin|internal|debug)/[a-zA-Z0-9_/.-]*)', js_content):
+        p = m.group(1)
+        if len(p) >= 4:
+            paths.add(p)
+
+    # GraphQL operation names
+    for m in re.finditer(r'(?:query|mutation|subscription)\s+([a-zA-Z][a-zA-Z0-9_]+)', js_content):
+        graphql_ops.add(m.group(1))
+
+    return {
+        "urls": sorted(urls),
+        "paths": sorted(paths),
+        "graphql_operations": sorted(graphql_ops),
+    }
 
 
 def _is_false_positive(val: str) -> bool:
@@ -625,9 +1284,19 @@ def js_map_scan_phase(live_hosts, output_dir, threads=10, timeout=10):
         js_urls = _extract_js_urls(target, resp.text)
         result.js_files_found = len(js_urls)
 
+        parsed_target = urlparse(target)
+        source_host = parsed_target.hostname or target
+        host_endpoints: dict = {"urls": set(), "paths": set(), "graphql_operations": set()}
+
         for js_url in js_urls:
             js_resp = _fetch(js_url)
             if not js_resp: continue
+
+            # --- JS endpoint extraction (Mod 4) ---
+            ep = _extract_js_endpoints(js_resp.text, source_host)
+            host_endpoints["urls"].update(ep["urls"])
+            host_endpoints["paths"].update(ep["paths"])
+            host_endpoints["graphql_operations"].update(ep["graphql_operations"])
 
             # Find source map reference
             map_url = None
@@ -660,6 +1329,16 @@ def js_map_scan_phase(live_hosts, output_dir, threads=10, timeout=10):
                     )
 
         result.secrets_found = len(result.findings)
+        result.endpoints = {
+            source_host: {
+                "urls": sorted(host_endpoints["urls"]),
+                "paths": sorted(host_endpoints["paths"]),
+                "graphql_operations": sorted(host_endpoints["graphql_operations"]),
+            }
+        }
+        total_ep = len(host_endpoints["urls"]) + len(host_endpoints["paths"])
+        if total_ep:
+            log_info(f"  {source_host}: {total_ep} endpoints extracted from JS")
         return result
 
     with ThreadPoolExecutor(max_workers=threads) as ex:
@@ -675,6 +1354,34 @@ def js_map_scan_phase(live_hosts, output_dir, threads=10, timeout=10):
     total_maps = sum(r.source_maps_found for r in all_results)
     total_secrets = sum(r.secrets_found for r in all_results)
     log_success(f"JS scan: {total_maps} source maps, {total_secrets} secrets")
+
+    # --- Write JS endpoint extraction output (Mod 4) ---
+    merged_endpoints: dict = {}
+    for r in all_results:
+        for host, ep_data in r.endpoints.items():
+            if host not in merged_endpoints:
+                merged_endpoints[host] = {"urls": set(), "paths": set(), "graphql_operations": set()}
+            merged_endpoints[host]["urls"].update(ep_data.get("urls", []))
+            merged_endpoints[host]["paths"].update(ep_data.get("paths", []))
+            merged_endpoints[host]["graphql_operations"].update(ep_data.get("graphql_operations", []))
+    if merged_endpoints:
+        structured = {
+            host: {
+                "urls": sorted(v["urls"]),
+                "paths": sorted(v["paths"]),
+                "graphql_operations": sorted(v["graphql_operations"]),
+            }
+            for host, v in merged_endpoints.items()
+        }
+        (output_dir / "js_extracted_endpoints.json").write_text(json.dumps(structured, indent=2))
+        flat_lines = []
+        for host, v in structured.items():
+            for u in v["urls"]: flat_lines.append(f"{host}\t{u}")
+            for p in v["paths"]: flat_lines.append(f"{host}\t{p}")
+        flat_lines = sorted(set(flat_lines))
+        (output_dir / "js_extracted_endpoints.txt").write_text("\n".join(flat_lines))
+        total_ep = sum(len(v["urls"]) + len(v["paths"]) for v in structured.values())
+        log_success(f"JS endpoint extraction: {total_ep} unique endpoints -> js_extracted_endpoints.json")
 
     all_findings = [f for r in all_results for f in r.findings]
     if all_findings:
@@ -699,14 +1406,29 @@ def js_map_scan_phase(live_hosts, output_dir, threads=10, timeout=10):
 # PHASE 6: SELECTIVE PORT SCANNING
 # ===========================================================================
 
-def selective_port_scan(httpx_data, output_dir, aggressive=False):
-    """Run nmap selectively on hosts that look interesting based on httpx data."""
+def selective_port_scan(httpx_data, output_dir, aggressive=False, deep=False):
+    """Run nmap (or masscan) selectively on hosts that look interesting based on httpx data.
+
+    Tiers:
+      default           top 200 TCP
+      aggressive        top 1000 TCP
+      deep + aggressive top 5000 TCP + UDP top 50 (for control-plane / datastore hosts)
+    """
     log_phase("PHASE 6: Selective Port Scanning")
-    if not check_tool("nmap"):
-        log_warning("nmap not installed, skipping."); return {}
+
+    has_nmap = check_tool("nmap")
+    has_masscan = check_tool("masscan")
+
+    if not has_nmap and not has_masscan:
+        log_warning("Neither nmap nor masscan installed, skipping."); return {}
 
     hosts_to_scan = set()
     reasons = {}
+    deep_scan_hosts = set()
+
+    control_plane_tech = ["jenkins", "tomcat", "jboss", "weblogic", "elasticsearch",
+                          "kibana", "grafana", "phpmyadmin", "couchdb", "redis",
+                          "mongodb", "memcached", "rabbitmq", "solr"]
 
     for e in httpx_data:
         url = e.get("url", ""); status = e.get("status_code", 0)
@@ -724,12 +1446,11 @@ def selective_port_scan(httpx_data, output_dir, aggressive=False):
         if status == 403:
             scan_reasons.append("403 forbidden")
 
-        interesting_tech = ["jenkins", "tomcat", "jboss", "weblogic", "elasticsearch",
-                           "kibana", "grafana", "phpmyadmin", "couchdb", "redis",
-                           "mongodb", "memcached", "rabbitmq", "solr"]
-        for t in interesting_tech:
+        for t in control_plane_tech:
             if any(t in ti for ti in tech) or t in server:
                 scan_reasons.append(f"interesting tech: {t}")
+                if deep:
+                    deep_scan_hosts.add(hostname)
 
         if scan_reasons:
             hosts_to_scan.add(hostname)
@@ -740,26 +1461,185 @@ def selective_port_scan(httpx_data, output_dir, aggressive=False):
 
     log_info(f"Scanning {len(hosts_to_scan)} hosts:")
     for h in sorted(hosts_to_scan):
-        print(f"  -> {h}: {', '.join(reasons.get(h, []))}")
+        tier = "deep" if h in deep_scan_hosts else ("aggressive" if aggressive else "default")
+        print(f"  -> {h} [{tier}]: {', '.join(reasons.get(h, []))}")
 
     nmap_results = {}
     nmap_dir = output_dir / "nmap"; nmap_dir.mkdir(exist_ok=True)
 
     for host in sorted(hosts_to_scan):
-        log_info(f"  nmap -> {host}")
+        log_info(f"  scanning -> {host}")
         safe = re.sub(r'[^a-zA-Z0-9._-]', '_', host)
-        xf = nmap_dir / f"{safe}.xml"
-        if aggressive:
-            cmd = ["nmap", "-sV", "-sC", "-T4", "-Pn", "--top-ports", "1000", "-oX", str(xf), host]
+
+        if has_nmap:
+            xf = nmap_dir / f"{safe}.xml"
+            if deep and aggressive and host in deep_scan_hosts:
+                # Deep tier: top 5000 TCP + UDP top 50
+                cmd_tcp = ["nmap", "-sV", "-sC", "-T4", "-Pn", "--top-ports", "5000",
+                           "-oX", str(nmap_dir / f"{safe}_tcp5k.xml"), host]
+                cmd_udp = ["nmap", "-sU", "-T3", "-Pn", "--top-ports", "50",
+                           "-oX", str(nmap_dir / f"{safe}_udp50.xml"), host]
+                out_tcp = run_command(cmd_tcp, timeout=600)
+                out_udp = run_command(cmd_udp, timeout=600)
+                output = out_tcp + out_udp
+            elif aggressive:
+                cmd = ["nmap", "-sV", "-sC", "-T4", "-Pn", "--top-ports", "1000",
+                       "-oX", str(xf), host]
+                output = run_command(cmd, timeout=300)
+            else:
+                cmd = ["nmap", "-sV", "-T3", "-Pn", "--top-ports", "200",
+                       "-oX", str(xf), host]
+                output = run_command(cmd, timeout=300)
         else:
-            cmd = ["nmap", "-sV", "-T3", "-Pn", "--top-ports", "200", "-oX", str(xf), host]
-        output = run_command(cmd, timeout=300)
-        nmap_results[host] = {"raw": output, "xml": str(xf), "reasons": reasons.get(host, [])}
+            # masscan fallback (full TCP)
+            xf = nmap_dir / f"{safe}_masscan.xml"
+            log_warning(f"  nmap not found — using masscan for {host}")
+            output = run_command(
+                ["masscan", "-p1-65535", "--rate", "1000", "-oX", str(xf), host],
+                timeout=600,
+            )
+
+        nmap_results[host] = {"raw": output, "xml": str(nmap_dir / f"{safe}.xml"),
+                              "reasons": reasons.get(host, [])}
         for line in output:
             if '/tcp' in line and 'open' in line:
                 log_success(f"    {line.strip()}")
 
     return nmap_results
+
+
+# ===========================================================================
+# PHASE 6.5: PARAMETER DISCOVERY
+# ===========================================================================
+
+def parameter_discovery(triage_actions: List, output_dir: Path) -> dict:
+    """Run paramspider/arjun on P1/P2 API, admin, and graphql hosts only."""
+    log_phase("PHASE 6.5: Parameter Discovery")
+
+    has_paramspider = check_tool("paramspider")
+    has_arjun = check_tool("arjun")
+
+    if not has_paramspider and not has_arjun:
+        log_warning("Neither paramspider nor arjun installed. Skipping parameter discovery.")
+        return {}
+
+    target_hosts: set = set()
+    for action in (triage_actions or []):
+        if action.priority in (1, 2):
+            target_hosts.add(action.host)
+
+    if not target_hosts:
+        log_info("No P1/P2 hosts identified for parameter discovery.")
+        return {}
+
+    if len(target_hosts) > 20:
+        log_warning(f"Too many P1/P2 hosts ({len(target_hosts)} > 20). Skipping parameter discovery.")
+        log_warning("Use --params-only for a focused parameter pass on specific hosts.")
+        return {}
+
+    params_dir = output_dir / "params"
+    params_dir.mkdir(exist_ok=True)
+    all_params: List[str] = []
+    params_json_data: dict = {}
+    generated_files: List[Path] = []
+
+    for host_url in sorted(target_hosts):
+        parsed = urlparse(host_url)
+        hostname = parsed.hostname or host_url
+        safe = re.sub(r'[^a-zA-Z0-9._-]', '_', hostname)
+        log_info(f"  {host_url}")
+
+        if has_paramspider:
+            pf = params_dir / f"{safe}.params"
+            lines = run_paramspider_for_host(hostname, pf, timeout=120)
+            if pf.exists():
+                generated_files.append(pf)
+            if lines:
+                all_params.extend(lines)
+                params_json_data.setdefault(hostname, {})["paramspider"] = lines
+                log_success(f"    {hostname}: {len(lines)} params (paramspider)")
+
+        if has_arjun:
+            pf = params_dir / f"{safe}.arjun.json"
+            run_command(
+                ["arjun", "-u", host_url, "-o", str(pf), "-t", "10"],
+                timeout=180,
+            )
+            if pf.exists():
+                generated_files.append(pf)
+                try:
+                    arjun_data = json.loads(pf.read_text())
+                    params_json_data.setdefault(hostname, {})["arjun"] = arjun_data
+                    log_success(f"    {hostname}: arjun results saved")
+                except Exception:
+                    pass
+
+    unique_params = sorted(set(all_params))
+    if unique_params:
+        write_lines(output_dir / "params.txt", unique_params)
+    if params_json_data:
+        (output_dir / "params.json").write_text(json.dumps(params_json_data, indent=2))
+        generated_files.append(output_dir / "params.json")
+    if unique_params:
+        generated_files.append(output_dir / "params.txt")
+    generated_files = list(dict.fromkeys(generated_files))
+
+    log_success(
+        f"Parameter discovery: {len(unique_params)} params across {len(params_json_data)} hosts"
+    )
+    if generated_files:
+        names = ", ".join(path.name for path in generated_files[:8])
+        if len(generated_files) > 8:
+            names += ", ..."
+        log_info(f"  output files: {names}")
+    return params_json_data
+
+
+# ===========================================================================
+# ASN EXPANSION (--asn flag)
+# ===========================================================================
+
+def asn_expansion(domain: str, output_dir: Path, include_live: bool = False) -> List[str]:
+    """Find ASN-owned IP ranges and probe for live hosts. Gated by --asn flag."""
+    log_phase("ASN EXPANSION")
+    org_name = domain.split(".")[0]
+    live_ips: List[str] = []
+
+    if check_tool("asnmap"):
+        log_info(f"Running asnmap for {domain}...")
+        asnmap_out = output_dir / "asnmap.txt"
+        run_command(["asnmap", "-d", domain, "-o", str(asnmap_out)], timeout=300)
+        if asnmap_out.exists():
+            cidrs = read_nonempty_lines(asnmap_out)
+            log_success(f"asnmap: {len(cidrs)} CIDR ranges")
+            if check_tool("nmap"):
+                for cidr in cidrs:
+                    log_info(f"  Probing {cidr} for live IPs...")
+                    result = run_command(
+                        ["nmap", "-sn", "-PS80,443", cidr, "--open", "-oG", "-"],
+                        timeout=300,
+                    )
+                    for line in result:
+                        ip_match = re.search(r'\b(\d{1,3}(?:\.\d{1,3}){3})\b', line)
+                        if ip_match and ("Up" in line or "open" in line):
+                            live_ips.append(ip_match.group(1))
+
+    if check_tool("amass"):
+        log_info(f"Running amass intel for org: {org_name}...")
+        amass_out = output_dir / "amass_intel.txt"
+        run_command(
+            ["amass", "intel", "-org", org_name, "-o", str(amass_out)],
+            timeout=600,
+        )
+
+    live_ips = sorted(set(live_ips))
+    (output_dir / "asn_expanded.txt").write_text("\n".join(live_ips))
+    log_success(f"ASN expansion: {len(live_ips)} live IPs -> asn_expanded.txt")
+
+    if not include_live:
+        log_info("ASN IPs not auto-included in scan (use --asn-include-live to add them).")
+        return []
+    return live_ips
 
 # ===========================================================================
 # PHASE 7: TRIAGE ENGINE - THE CORE UPGRADE
@@ -826,7 +1706,8 @@ def _looks_like_data_exposure_candidate(profile: dict) -> bool:
 
     return False
 
-def triage_engine(httpx_data, tech_results, nmap_results, js_findings, output_dir):
+def triage_engine(httpx_data, tech_results, nmap_results, js_findings, output_dir,
+                  archive_data=None, js_endpoints_data=None, params_data=None, favicons_data=None):
     """
     Phase 7: Analyze all collected data and produce per-host playbooks.
     Maps (technology + status + response data) -> concrete commands.
@@ -1094,6 +1975,85 @@ def triage_engine(httpx_data, tech_results, nmap_results, js_findings, output_di
                 reason=f"Leaked {finding.severity} secret: {finding.secret_type}",
                 notes=f"Entropy: {finding.entropy}",
             ))
+
+    # ---- New enumeration signals (Mod 10) ----
+
+    # Archive URLs: many interesting patterns -> suggest review
+    if archive_data and isinstance(archive_data, dict):
+        per_host = archive_data.get("per_host", {})
+        interesting_count = archive_data.get("interesting", 0)
+        for hostname, url_count in per_host.items():
+            if url_count > 50:
+                matching_urls = [u for u in host_profiles if hostname in u]
+                target_url = matching_urls[0] if matching_urls else hostname
+                add_action(TriageAction(
+                    host=target_url, category="archive_review", priority=2, tool="curl",
+                    command=(
+                        f"# Review historical URLs for {hostname}\n"
+                        f"cat {output_dir}/archive_urls_interesting.txt | grep {hostname}\n"
+                        f"# Also check: {output_dir}/archive_urls/{re.sub(r'[^a-zA-Z0-9._-]', '_', hostname)}.txt"
+                    ),
+                    reason=f"Historical URL archive: {url_count} URLs ({interesting_count} interesting patterns)",
+                    notes="Check for still-live removed endpoints, leaked params, backup files.",
+                ))
+
+    # JS extracted endpoints -> suggest testing auth boundary
+    if js_endpoints_data and isinstance(js_endpoints_data, dict):
+        for host, ep_data in js_endpoints_data.items():
+            ep_count = len(ep_data.get("urls", [])) + len(ep_data.get("paths", []))
+            if ep_count > 5:
+                matching_urls = [u for u in host_profiles if host in u]
+                target_url = matching_urls[0] if matching_urls else host
+                add_action(TriageAction(
+                    host=target_url, category="js_endpoint_test", priority=2, tool="ffuf",
+                    command=(
+                        f"# Test JS-extracted endpoints for {host}\n"
+                        f"# Endpoints in: {output_dir}/js_extracted_endpoints.txt\n"
+                        f"ffuf -u {target_url}/FUZZ -w {output_dir}/js_extracted_endpoints.txt "
+                        f"-mc 200,201,301,302,401,403,405 -t 20"
+                    ),
+                    reason=f"JS endpoint extraction: {ep_count} paths/URLs found in JS bundles",
+                    notes="Test unauthenticated access and compare auth vs unauth responses.",
+                ))
+
+    # Parameter discovery results -> suggest testing
+    if params_data and isinstance(params_data, dict):
+        for hostname, pdata in params_data.items():
+            paramspider = pdata.get("paramspider", [])
+            if paramspider:
+                matching_urls = [u for u in host_profiles if hostname in u]
+                target_url = matching_urls[0] if matching_urls else hostname
+                add_action(TriageAction(
+                    host=target_url, category="param_test", priority=2, tool="ffuf",
+                    command=(
+                        f"# Test discovered parameters for {hostname}\n"
+                        f"# Params in: {output_dir}/params/{re.sub(r'[^a-zA-Z0-9._-]', '_', hostname)}.params\n"
+                        f"ffuf -u {target_url}?FUZZ=test -w {output_dir}/params.txt "
+                        f"-mc 200,201,301,302,401,403 -t 20"
+                    ),
+                    reason=f"Parameter discovery: {len(paramspider)} parameters found",
+                    notes="Fuzz for SQLi, SSRF, IDOR using discovered parameter names.",
+                ))
+
+    # Favicon hash clustering -> flag hosts sharing hash with out-of-scope
+    if favicons_data and isinstance(favicons_data, dict):
+        hash_groups = favicons_data.get("hash_groups", {})
+        for fhash, grouped_hosts in hash_groups.items():
+            if len(grouped_hosts) > 1:
+                for gh in grouped_hosts:
+                    matching_urls = [u for u in host_profiles if gh in u]
+                    target_url = matching_urls[0] if matching_urls else gh
+                    add_action(TriageAction(
+                        host=target_url, category="asset_cluster", priority=3, tool="manual",
+                        command=(
+                            f"# Asset clustering via favicon hash {fhash}\n"
+                            f"# Hosts sharing this hash: {', '.join(grouped_hosts)}\n"
+                            f"# Shodan query: http.favicon.hash:{fhash}\n"
+                            f"# FOFA query: icon_hash=\"{fhash}\""
+                        ),
+                        reason=f"Shared favicon hash with {len(grouped_hosts)-1} other host(s) — possible related assets",
+                        notes="Investigate if any shared-hash hosts are out-of-scope but same infrastructure.",
+                    ))
 
     # ---- Deduplicate ----
     seen = set()
@@ -1753,7 +2713,9 @@ def _recommended_first_steps(profile: Dict[str, Any]) -> List[str]:
     return list(dict.fromkeys(steps))[:4]
 
 
-def build_xlimit_summary(domain, subdomains, live_hosts, httpx_data, triage_actions, tech_results, js_findings, nmap_results, output_dir):
+def build_xlimit_summary(domain, subdomains, live_hosts, httpx_data, triage_actions, tech_results,
+                         js_findings, nmap_results, output_dir,
+                         archive_data=None, js_endpoints_data=None, params_data=None, favicons_data=None):
     log_info("Generating xLimit summary...")
     actions_by_host = defaultdict(list)
     for action in triage_actions or []:
@@ -1788,6 +2750,26 @@ def build_xlimit_summary(domain, subdomains, live_hosts, httpx_data, triage_acti
         secret_counts = Counter((f.severity or "").lower() for f in findings)
         categories = sorted({a.category for a in actions})
         roles = infer_target_roles(url, entry.get("title", ""), tech, entry.get("webserver", ""), set(categories))
+        # New enumeration data lookups (Mod 10)
+        archive_per_host = (archive_data or {}).get("per_host", {}) if isinstance(archive_data, dict) else {}
+        archive_url_count = archive_per_host.get(hostname, 0)
+        js_ep = (js_endpoints_data or {}).get(hostname, {}) if isinstance(js_endpoints_data, dict) else {}
+        extracted_endpoint_count = len(js_ep.get("urls", [])) + len(js_ep.get("paths", []))
+        host_params = (params_data or {}).get(hostname, {}) if isinstance(params_data, dict) else {}
+        discovered_param_count = len(host_params.get("paramspider", []))
+        favicon_by_host = (favicons_data or {}).get("by_host", {}) if isinstance(favicons_data, dict) else {}
+        favicon_hash = favicon_by_host.get(hostname)
+
+        # Enumeration depth: how many sources contributed data for this host
+        enum_depth_sources = sum([
+            bool(archive_url_count),
+            bool(extracted_endpoint_count),
+            bool(discovered_param_count),
+            bool(favicon_hash),
+            bool(findings),
+            hostname in (nmap_results or {}),
+        ])
+
         profile = {
             "host": url,
             "hostname": hostname,
@@ -1804,6 +2786,11 @@ def build_xlimit_summary(domain, subdomains, live_hosts, httpx_data, triage_acti
             "secret_severity_counts": dict(secret_counts),
             "nmap_selected": hostname in (nmap_results or {}),
             "nmap_reasons": (nmap_results or {}).get(hostname, {}).get("reasons", []),
+            "archive_url_count": archive_url_count,
+            "extracted_endpoint_count": extracted_endpoint_count,
+            "discovered_param_count": discovered_param_count,
+            "favicon_hash": favicon_hash,
+            "enumeration_depth": enum_depth_sources,
             "example_actions": [
                 {
                     "category": a.category,
@@ -1926,7 +2913,7 @@ def build_xlimit_summary(domain, subdomains, live_hosts, httpx_data, triage_acti
             "summary_type": "xlimit_recon_summary",
             "target": domain,
             "generated_at": datetime.datetime.now().isoformat(),
-            "version": "1.3",
+            "version": "1.4",
             "scan_scope": {
                 "subdomains_total": len(subdomains or []),
                 "live_hosts_total": len(live_hosts or []),
@@ -1934,6 +2921,16 @@ def build_xlimit_summary(domain, subdomains, live_hosts, httpx_data, triage_acti
                 "js_secret_findings_total": sum(len(getattr(r, 'findings', [])) for r in (js_findings or [])),
                 "triage_actions_total": len(triage_actions or []),
                 "nmap_hosts_total": len(nmap_results or {}),
+                "archive_urls_total": (archive_data or {}).get("total", 0) if isinstance(archive_data, dict) else 0,
+                "js_extracted_endpoints_total": sum(
+                    len(v.get("urls", [])) + len(v.get("paths", []))
+                    for v in (js_endpoints_data or {}).values()
+                ) if isinstance(js_endpoints_data, dict) else 0,
+                "params_discovered_total": sum(
+                    len(v.get("paramspider", []))
+                    for v in (params_data or {}).values()
+                ) if isinstance(params_data, dict) else 0,
+                "favicon_hashes_total": len((favicons_data or {}).get("by_host", {})) if isinstance(favicons_data, dict) else 0,
             },
         },
         "global_assessment": {
@@ -1960,6 +2957,13 @@ def build_xlimit_summary(domain, subdomains, live_hosts, httpx_data, triage_acti
                     "categories": p["categories"],
                     "js_secrets": p["js_secrets_count"],
                     "action_counts": p["action_counts"],
+                },
+                "enumeration": {
+                    "archive_url_count": p.get("archive_url_count", 0),
+                    "extracted_endpoint_count": p.get("extracted_endpoint_count", 0),
+                    "discovered_param_count": p.get("discovered_param_count", 0),
+                    "favicon_hash": p.get("favicon_hash"),
+                    "enumeration_depth": p.get("enumeration_depth", 0),
                 },
                 "recommended_first_steps": p["recommended_first_steps"],
                 "deprioritize_reasons": p["deprioritize_reasons"],
@@ -2097,9 +3101,18 @@ def preflight_check():
         else: log_warning(f"Wordlist {name}: NOT FOUND ({path})")
     print()
     if HAS_REQUESTS: log_success("Python: requests ok")
-    else: log_warning("Python: requests missing (JS scan disabled)")
+    else: log_warning("Python: requests missing (JS scan, crt.sh, favicon disabled)")
     if HAS_BS4: log_success("Python: beautifulsoup4 ok")
     else: log_warning("Python: beautifulsoup4 missing (regex fallback)")
+    if HAS_MMH3: log_success("Python: mmh3 ok")
+    else: log_warning("Python: mmh3 missing (favicon hashing disabled) — install: pip install mmh3")
+    print()
+    github_token = os.environ.get("GITHUB_TOKEN", "")
+    pdcp_key = os.environ.get("PDCP_API_KEY", "")
+    if github_token: log_success("Env: GITHUB_TOKEN set (github-subdomains enabled)")
+    else: log_warning("Env: GITHUB_TOKEN not set (github-subdomains will skip)")
+    if pdcp_key: log_success("Env: PDCP_API_KEY set (chaos enabled)")
+    else: log_warning("Env: PDCP_API_KEY not set (chaos will skip)")
     if not ok:
         log_error("Missing required tools."); sys.exit(1)
     print()
@@ -2112,28 +3125,54 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python3 xlimit_recon.py -d example.com                     Basic scan
-  python3 xlimit_recon.py -d example.com --deep               Deep enumeration
-  python3 xlimit_recon.py -d example.com --deep --run-nmap    Deep + port scanning
-  python3 xlimit_recon.py --scope scope.csv                   Multi-domain from HackerOne CSV
-  python3 xlimit_recon.py --scope scope.csv --bounty-only     Only bounty-eligible targets
-  python3 xlimit_recon.py -d example.com --monitor            Continuous monitoring
+  python3 xlimit_recon.py -d example.com                           Basic scan
+  python3 xlimit_recon.py -d example.com --deep                    Deep enumeration (amass, brute, perms, DNS resolve)
+  python3 xlimit_recon.py -d example.com --deep --deep-dns         Deep + 5M-name DNS brute wordlist
+  python3 xlimit_recon.py -d example.com --deep --run-nmap         Deep + port scanning
+  python3 xlimit_recon.py -d example.com --deep --run-nmap --nmap-aggressive   Deep + top 5000 + UDP
+  python3 xlimit_recon.py --scope scope.csv                        Multi-domain from HackerOne CSV
+  python3 xlimit_recon.py --scope scope.csv --bounty-only          Only bounty-eligible targets
+  python3 xlimit_recon.py -d example.com --monitor                 Continuous monitoring
   python3 xlimit_recon.py -d example.com --custom-header "X-Bug-Bounty: researcher123"
-  python3 xlimit_recon.py -d example.com --skip-js-scan       Skip JS source map scanning
+  python3 xlimit_recon.py -d example.com --skip-js-scan            Skip JS source map scanning
+  python3 xlimit_recon.py -d example.com --skip-archive            Skip wayback/archive enumeration
+  python3 xlimit_recon.py -d example.com --deep-archives           Use deeper archive providers for Phase 4.5
+  python3 xlimit_recon.py -d example.com --asn                     ASN expansion (owned IP ranges)
+  python3 xlimit_recon.py -d example.com --asn --asn-include-live  Include ASN IPs in live scan
+  python3 xlimit_recon.py -d example.com --params-only             Parameter discovery only (reuse output)
+
+Env vars for optional sources:
+  GITHUB_TOKEN    Enable github-subdomains subdomain enumeration
+  PDCP_API_KEY    Enable chaos (Project Discovery) subdomain dataset
         """)
     parser.add_argument("-d", "--domain", help="Target domain")
     parser.add_argument("--scope", help="HackerOne scope CSV")
     parser.add_argument("--bounty-only", action="store_true")
-    parser.add_argument("--deep", action="store_true", help="Deep enumeration")
+    parser.add_argument("--deep", action="store_true",
+                        help="Deep enumeration: amass, DNS brute, permutations, DNS resolution")
+    parser.add_argument("--deep-dns", action="store_true",
+                        help="Use larger DNS brute wordlist (5M names). Requires --deep.")
     parser.add_argument("--monitor", action="store_true")
     parser.add_argument("--interval", type=int, default=6, help="Monitor hours (default: 6)")
-    parser.add_argument("--custom-header", default="", help="Optional custom header applied to live requests and generated commands, format: 'Header-Name: value'")
+    parser.add_argument("--custom-header", default="",
+                        help="Optional custom header: 'Header-Name: value'")
     parser.add_argument("--skip-screenshots", action="store_true")
     parser.add_argument("--skip-js-scan", action="store_true")
+    parser.add_argument("--skip-archive", "--skip-archives", dest="skip_archive", action="store_true",
+                        help="Skip archive/wayback URL enumeration (Phase 4.5)")
+    parser.add_argument("--deep-archives", action="store_true",
+                        help="Use deeper archive providers (wayback, OTX, Common Crawl) for Phase 4.5")
     parser.add_argument("--run-nmap", action="store_true", help="Enable selective nmap")
-    parser.add_argument("--nmap-aggressive", action="store_true")
+    parser.add_argument("--nmap-aggressive", action="store_true",
+                        help="Use aggressive nmap flags (top 1000 ports). With --deep: top 5000 + UDP.")
     parser.add_argument("--js-threads", type=int, default=10)
     parser.add_argument("--output", help="Custom output dir")
+    parser.add_argument("--asn", action="store_true",
+                        help="Expand to ASN-owned IP ranges (amass intel + asnmap + nmap ping)")
+    parser.add_argument("--asn-include-live", action="store_true",
+                        help="Include ASN-discovered live IPs in Phase 2 scan (use with care: may be OOS)")
+    parser.add_argument("--params-only", action="store_true",
+                        help="Re-run parameter discovery only on existing recon output")
     args = parser.parse_args()
 
     if not args.domain and not args.scope:
@@ -2176,39 +3215,82 @@ Examples:
         od = ensure_output_dir(domain)
         log_info(f"Output: {od}")
 
-        # Phase 1
-        subs = subdomain_enumeration(domain, od, deep=args.deep)
+        # Phase 1: Subdomain enumeration (expanded sources)
+        subs = subdomain_enumeration(domain, od, deep=args.deep, deep_dns=args.deep_dns)
         if oos: subs = filter_out_of_scope(subs, oos)
 
-        # Phase 2
-        live, hdata = live_host_detection(subs, od)
+        # Phase 1.5: Subdomain permutations (--deep only)
+        permutation_step(od, deep=args.deep)
+
+        # Phase 1.7: DNS resolution (dnsx/massdns); updates Phase 2 input
+        resolved = dns_resolution_step(od)
+        phase2_input = resolved if resolved else subs
+
+        # ASN expansion (--asn flag)
+        asn_extra = []
+        if args.asn:
+            asn_extra = asn_expansion(domain, od, include_live=args.asn_include_live)
+        if asn_extra:
+            phase2_input = sorted(set(phase2_input) | set(asn_extra))
+
+        # Phase 2: Live host detection
+        live, hdata = live_host_detection(phase2_input, od)
         if oos: live = filter_out_of_scope(live, oos)
 
-        # Phase 3
+        # Phase 3: Screenshots
         if not args.skip_screenshots: take_screenshots(live, od)
 
-        # Phase 4
+        # Phase 4: Technology fingerprinting
         tech = technology_fingerprint(live, od)
 
-        # Phase 5
+        # Phase 4.5: Archive enumeration
+        archive_data = archive_enumeration(
+            live,
+            od,
+            skip=args.skip_archive,
+            deep_archives=(args.deep or args.deep_archives),
+        )
+
+        # Phase 4.7: Favicon hashing
+        favicons_data = favicon_hashing(live, od)
+
+        # Phase 5: JS source map scanning + endpoint extraction
         jsf = []
+        js_endpoints_data = {}
         if not args.skip_js_scan:
             jsf = js_map_scan_phase(live, od, threads=args.js_threads)
+            ep_file = od / "js_extracted_endpoints.json"
+            if ep_file.exists():
+                try:
+                    js_endpoints_data = json.loads(ep_file.read_text())
+                except Exception:
+                    js_endpoints_data = {}
 
-        # Phase 6
+        # Phase 6: Selective port scanning
         nmap = {}
         if args.run_nmap:
-            nmap = selective_port_scan(hdata, od, aggressive=args.nmap_aggressive)
+            nmap = selective_port_scan(hdata, od, aggressive=args.nmap_aggressive, deep=args.deep)
 
-        # Phase 7 - THE MONEY PHASE
-        ta = triage_engine(hdata, tech, nmap, jsf, od)
+        # Phase 7: Triage (with new enumeration signals)
+        ta = triage_engine(hdata, tech, nmap, jsf, od,
+                           archive_data=archive_data,
+                           js_endpoints_data=js_endpoints_data,
+                           params_data=None,
+                           favicons_data=favicons_data)
 
-        # Phase 8
+        # Phase 6.5: Parameter discovery (runs after triage to use P1/P2 info)
+        params_data = parameter_discovery(ta, od)
+
+        # Phase 8: Report Generation
         log_phase("PHASE 8: Report Generation")
         generate_text_report(domain, subs, live, hdata, ta, tech, jsf, od)
         generate_json_report(domain, subs, live, hdata, ta, tech, jsf, nmap, od)
         generate_html_report(domain, subs, live, hdata, ta, tech, jsf, od)
-        build_xlimit_summary(domain, subs, live, hdata, ta, tech, jsf, nmap, od)
+        build_xlimit_summary(domain, subs, live, hdata, ta, tech, jsf, nmap, od,
+                             archive_data=archive_data,
+                             js_endpoints_data=js_endpoints_data,
+                             params_data=params_data,
+                             favicons_data=favicons_data)
 
         all_results[domain] = {
             "subdomains": len(subs), "live_hosts": len(live),
