@@ -25,7 +25,8 @@ from pathlib import Path
 
 TOKEN_FILE = Path.home() / ".config" / "xlimit" / "token.env"
 SYNTHESIZE_URL = "https://api.xlimit.org/proxy/synthesize"
-REQUEST_TIMEOUT_SECONDS = 30
+# Must stay above xlimit-agent's synthesis read timeout (currently 120s) so the two don't drift out of sync.
+REQUEST_TIMEOUT_SECONDS = 150
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "xlimit"
