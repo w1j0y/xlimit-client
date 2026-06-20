@@ -10,6 +10,9 @@ mkdir -p "$INSTALL_DIR"
 cp "$REPO_DIR"/client/*.sh "$INSTALL_DIR"/
 chmod 700 "$INSTALL_DIR"/*.sh
 
+cp "$REPO_DIR"/mcp/xlimit_mcp_server.py "$INSTALL_DIR"/
+chmod 700 "$INSTALL_DIR"/xlimit_mcp_server.py
+
 mkdir -p "$CONFIG_DIR"
 chmod 700 "$CONFIG_DIR"
 
@@ -31,6 +34,7 @@ Installed scripts:
   $INSTALL_DIR/xlimit_search.sh
   $INSTALL_DIR/xlimit_search_text.sh
   $INSTALL_DIR/xlimit_context.sh
+  $INSTALL_DIR/xlimit_mcp_server.py
 
 $TOKEN_STATUS
 
@@ -40,4 +44,8 @@ Next steps:
      $INSTALL_DIR/xlimit_search_text.sh "graphql introspection authorization" knowledge
   3. For local assistants, prefer:
      $INSTALL_DIR/xlimit_context.sh "<full user prompt>"
+  4. For automatic retrieval inside Claude Code or Codex, register the MCP
+     server instead:
+       claude mcp add xlimit -- python3 $INSTALL_DIR/xlimit_mcp_server.py
+     (or the Codex TOML block — see README.md)
 EOF

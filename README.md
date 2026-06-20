@@ -156,6 +156,28 @@ For screenshots, demos, or recordings where you do not want Claude Code to show 
 IS_DEMO=1 CLAUDE_CODE_HIDE_CWD=1 claude
 ```
 
+## Using xLimit via MCP (Claude Code / Codex)
+
+`mcp/xlimit_mcp_server.py` exposes xLimit hosted synthesis as a single MCP tool, `xlimit_ask`, over the stdio transport, so an agent can call it directly instead of a human running a client script and pasting the output into a prompt. `xlimit_ask` takes a natural-language security question and returns synthesized prose guidance that chains xLimit's methodology knowledge with real pattern and failure-mode experience — it is advisory guidance written to answer your question, not a list of raw reference snippets, so a calling agent should treat it as supporting input rather than source material to quote or re-summarize. It reads the same `~/.config/xlimit/token.env` file as the shell wrappers — no separate credential setup. It is installed by `install.sh` alongside the shell scripts, at `~/xlimit-client/xlimit_mcp_server.py`.
+
+**This is a different code path from the shell wrappers above.** `client/xlimit_search.sh`, `client/xlimit_search_text.sh`, and `client/xlimit_context.sh` call `/search` directly and return raw ranked snippets with `result_id`/`source`/`score`. `xlimit_ask` over MCP calls a different endpoint, `/proxy/synthesize`, and returns a single synthesized answer with no snippets or scores. If MCP output and shell-script output read differently for what feels like the same question, that's expected — they're hitting different endpoints with different response shapes, not the same retrieval with different formatting.
+
+Register it with Claude Code:
+
+```bash
+claude mcp add xlimit -- python3 ~/xlimit-client/xlimit_mcp_server.py
+```
+
+Register it with Codex by adding this block to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.xlimit]
+command = "python3"
+args = ["~/xlimit-client/xlimit_mcp_server.py"]
+```
+
+If Codex runs in `workspace-write` sandbox mode, it needs outbound network access for the MCP server's request to `api.xlimit.org` to succeed, same as the shell wrapper. See the "Codex cannot reach `api.xlimit.org`" troubleshooting section below for the `network_access = true` config.
+
 ## Vibe-coder web/API testing prompts
 
 If you are building a website or API with a coding agent and want a security sanity check before going live, use the prompt templates in:
